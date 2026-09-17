@@ -1,0 +1,68 @@
+From 314f7d01aa1e1ead4401355db09923321587a84e Mon Sep 17 00:00:00 2001
+From: br1uhnz <br1uhnz@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 22:01:26 -0500
+Subject: [PATCH] drm/amd/display: bound the tile recovery escalation; fix an
+ EDID swap race
+
+- The link-health escalation (link status BAD -> compositor full modeset) was
+  bounded per minute only; a panel that never comes right would be modeset
+  three times a minute forever. Add a per-boot cap of 12 and warn once.
+- amdgpu_dm_reprobe_tiled_root_after_slave() freed and re-allocated the
+  connector's cached drm_edid before taking mode_config.mutex, racing a
+  concurrent probe that reads it. Swap it under the lock.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 8 +++++---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h | 2 ++
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 8def9ef..10f0b9a 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -9745,10 +9745,10 @@ static void amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev)
+ 		product = sink->dc_edid.raw_edid[10] |
+ 			  (sink->dc_edid.raw_edid[11] << 8);
+ 		/* Keep the connector's cached EDID (what get_modes consumes) in step. */
++		mutex_lock(&dev->mode_config.mutex);
+ 		drm_edid_free(root->drm_edid);
+ 		root->drm_edid = drm_edid_alloc((const struct edid *)sink->dc_edid.raw_edid,
+ 						sink->dc_edid.length);
+-		mutex_lock(&dev->mode_config.mutex);
+ 		amdgpu_dm_tiled_stitch_edid_connector_update(root, root->drm_edid);
+ 		/* The re-read root now carries the tile block; hide it again. */
+ 		amdgpu_dm_tiled_stitch_hide_tile_property(root);
+@@ -16095,11 +16095,13 @@ static void amdgpu_dm_tiled_request_full_modeset(struct amdgpu_device *adev)
+ 		adev->dm.tiled_bad_window = jiffies;
+ 		adev->dm.tiled_bad_count = 0;
+ 	}
+-	if (adev->dm.tiled_bad_count >= APPLE5K_BAD_PER_MINUTE) {
+-		drm_warn(dev, "APPLE5K: full-modeset requests rate limited; leaving the panel as it is\n");
++	if (adev->dm.tiled_bad_count >= APPLE5K_BAD_PER_MINUTE ||
++	    adev->dm.tiled_bad_total >= APPLE5K_BAD_PER_BOOT) {
++		drm_warn_once(dev, "APPLE5K: full-modeset requests rate limited; leaving the panel as it is\n");
+ 		return;
+ 	}
+ 	adev->dm.tiled_bad_count++;
++	adev->dm.tiled_bad_total++;
+ 
+ 	for (i = 0; i < dc->link_count; i++) {
+ 		if (dc_link_is_apple_tiled_root(dc->links[i])) {
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index 728a290..5ab1c46 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -669,7 +669,9 @@ struct amdgpu_display_manager {
+ 	bool tiled_link_status_bad;
+ 	unsigned long tiled_bad_window;
+ 	u8 tiled_bad_count;
++	u8 tiled_bad_total;
+ #define APPLE5K_BAD_PER_MINUTE 3
++#define APPLE5K_BAD_PER_BOOT 12
+ /* DCE < 12: re-run the one-shot OTG alignment only beyond this phase error. */
+ #define APPLE5K_REALIGN_TOLERANCE_LINES 3
+ 	bool disable_hpd_irq;
+-- 
+2.55.0
+

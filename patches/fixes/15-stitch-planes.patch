@@ -1,0 +1,234 @@
+From c6da807678092fcff5e45de6cdcfe35aba6da211 Mon Sep 17 00:00:00 2001
+From: br1uhnz <br1uhnz@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 22:01:06 -0500
+Subject: [PATCH] drm/amd/display: only split planes the tiles can show
+
+P0-2/P0-3 from the stack review.
+
+1. Plane guard. The stitch created the peer (right-tile) plane only when the
+   framebuffer was at least two tiles wide and otherwise silently showed the
+   left tile alone, and it overwrote src/dst/clip unconditionally, so a
+   scaled or cropped direct-scanout plane (fullscreen video/games at a
+   non-native size) was accepted at TEST_ONLY and displayed wrong; an empty
+   per-tile viewport reaches dce_transform_get_optimal_number_of_taps(),
+   which divides by the viewport width -- the most plausible mechanism of
+   the KDE idle-dim hard hang reported against this stack. Now a plane on a
+   stitched CRTC is accepted only if it is the primary plane at (0,0),
+   unscaled, unrotated, full mode size, on a buffer at least as large as the
+   mode; anything else is -EINVAL at atomic check, so KWin composites.
+   Async (tearing) flips are refused on a stitched CRTC: the two tile
+   updates would tear independently.
+
+2. Peer plane lifecycle. The peer plane was captured only on a real flip
+   (old and new fb), so a modeset, DPMS-on or resume commit -- no old fb --
+   never sent the peer stream a surface update: the right tile came up
+   black until the next flip. Capture the peer before the flip shortcut and
+   always send it .surface/.scaling_info, adding .flip_addr/.plane_info
+   only on a flip. prepare_fb now refreshes the peer plane's buffer address
+   like the root's, so the peer never scans out the address computed at
+   atomic-check time.
+
+Not needed: an explicit zero-surface peer update when the primary goes away
+under an active CRTC -- amdgpu_dm's CRTC check refuses an enabled CRTC
+without its primary plane, so that state cannot be committed.
+
+Hardware verification: fullscreen scaled content must either composite
+(both halves correct) or be rejected, never a wrong/black right half;
+after s2idle resume and DPMS-on the right tile must show the same frame as
+the left immediately; no dce_transform WARN in the journal.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 87 ++++++++++++++++---
+ .../amd/display/amdgpu_dm/amdgpu_dm_crtc.c    | 12 +++
+ .../amd/display/amdgpu_dm/amdgpu_dm_plane.c   | 18 ++++
+ 3 files changed, 105 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index e91706a..e04a22f 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -11796,6 +11796,7 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_commit *state,
+ 	struct dc_surface_update tiled_peer_su = {0};
+ 	struct dc_stream_update tiled_peer_stream_update = {0};
+ 	int tiled_peer_idx = 0;
++	bool tiled_peer_flip = false;
+ 
+ 	/* update planes when needed */
+ 	for_each_oldnew_plane_in_state(state, plane, old_plane_state, new_plane_state, i) {
+@@ -11870,6 +11871,18 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_commit *state,
+ 						 tile_w, tile_h);
+ 			tiled_stitch_set_scaling(&bundle->scaling_infos[planes_count],
+ 						 0, tile_w, tile_h);
++			/*
++			 * Captured here, before the flip shortcut below, so the
++			 * peer is (re)attached on every commit that touches the
++			 * primary -- a modeset, a DPMS-on or a resume commit has
++			 * no old fb and is not a flip, yet the right tile must
++			 * come up in the same frame as the left one. The peer
++			 * plane state carries its own buffer address (refreshed
++			 * in prepare_fb); flip_addr/plane_info are added only
++			 * when this really is a flip.
++			 */
++			tiled_peer_plane = dm_new_plane_state->dc_state_peer;
++			tiled_peer_idx = planes_count;
+ 		}
+ 
+ 		plane_needs_flip = old_plane_state->fb && new_plane_state->fb;
+@@ -11895,16 +11908,10 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_commit *state,
+ 		bundle->surface_updates[planes_count].plane_info =
+ 			&bundle->plane_infos[planes_count];
+ 
+-		/* Tiled stitch: capture the peer plane only on an actual flip, so
+-		 * its reuse of this index's flip_addr/plane_info (just filled) is
+-		 * valid. */
+-		if (acrtc_state->stream_peer && dm_new_plane_state->dc_state_peer &&
+-		    plane == pcrtc->primary && new_plane_state->fb &&
+-		    new_plane_state->fb->width >=
+-			    2 * acrtc_state->stream->timing.h_addressable) {
+-			tiled_peer_plane = dm_new_plane_state->dc_state_peer;
+-			tiled_peer_idx = planes_count;
+-		}
++		/* Tiled stitch: this index's flip_addr/plane_info (just filled)
++		 * are valid for the peer plane captured above. */
++		if (tiled_peer_plane && tiled_peer_plane == dm_new_plane_state->dc_state_peer)
++			tiled_peer_flip = true;
+ 
+ 		if (acrtc_state->stream->link->psr_settings.psr_feature_enabled ||
+ 		    acrtc_state->stream->link->replay_settings.replay_feature_enabled) {
+@@ -12129,8 +12136,10 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_commit *state,
+ 			}
+ 			tiled_peer_su.surface = tiled_peer_plane;
+ 			tiled_peer_su.scaling_info = &tiled_peer_scaling;
+-			tiled_peer_su.flip_addr = &bundle->flip_addrs[tiled_peer_idx];
+-			tiled_peer_su.plane_info = &bundle->plane_infos[tiled_peer_idx];
++			if (tiled_peer_flip) {
++				tiled_peer_su.flip_addr = &bundle->flip_addrs[tiled_peer_idx];
++				tiled_peer_su.plane_info = &bundle->plane_infos[tiled_peer_idx];
++			}
+ 
+ 			update_planes_and_stream_adapter(dm->dc,
+ 						 acrtc_state->update_type,
+@@ -14334,6 +14343,53 @@ static bool dm_should_update_native_cursor(struct drm_atomic_commit *state,
+ 	}
+ }
+ 
++/*
++ * Tiled stitch: the stitched CRTC is scanned out as two tile streams, each
++ * showing one half of the framebuffer through a fixed 1:1 viewport. Only a
++ * full-size, unscaled, unrotated primary plane can be split that way. Refuse
++ * anything else here (TEST_ONLY included) so the compositor composites
++ * instead of trying direct scanout of a scaled or cropped buffer -- which the
++ * split code would otherwise accept and show wrong, or hand the hardware an
++ * empty per-tile viewport: dce_transform's scaler-taps computation divides by
++ * the viewport width (WARN + division by zero, the suspected mechanism of the
++ * reported idle-dim hang on Plasma).
++ */
++static int amdgpu_dm_tiled_stitch_check_plane(const struct drm_plane_state *ps,
++					      const struct drm_crtc_state *cs)
++{
++	const struct drm_display_mode *mode = &cs->mode;
++
++	if (ps->plane->type == DRM_PLANE_TYPE_CURSOR)
++		return 0;
++
++	if (ps->plane->type != DRM_PLANE_TYPE_PRIMARY) {
++		drm_dbg_atomic(ps->plane->dev,
++			       "TILED_STITCH: [PLANE:%d:%s] only the primary plane can be split across the tiles\n",
++			       ps->plane->base.id, ps->plane->name);
++		return -EINVAL;
++	}
++
++	if (ps->src_x || ps->src_y || ps->crtc_x || ps->crtc_y ||
++	    ps->src_w != (u32)ps->crtc_w << 16 ||
++	    ps->src_h != (u32)ps->crtc_h << 16 ||
++	    ps->crtc_w != mode->hdisplay || ps->crtc_h != mode->vdisplay ||
++	    ps->rotation != DRM_MODE_ROTATE_0 || !ps->fb ||
++	    ps->fb->width < (u32)mode->hdisplay ||
++	    ps->fb->height < (u32)mode->vdisplay || !(mode->hdisplay / 2)) {
++		drm_dbg_atomic(ps->plane->dev,
++			       "TILED_STITCH: [PLANE:%d:%s] src(%d,%d %ux%u) dst(%d,%d %dx%d) rot=0x%x fb=%ux%u cannot be split across the %dx%d tiles\n",
++			       ps->plane->base.id, ps->plane->name,
++			       ps->src_x >> 16, ps->src_y >> 16,
++			       ps->src_w >> 16, ps->src_h >> 16,
++			       ps->crtc_x, ps->crtc_y, ps->crtc_w, ps->crtc_h,
++			       ps->rotation,
++			       ps->fb ? ps->fb->width : 0, ps->fb ? ps->fb->height : 0,
++			       mode->hdisplay, mode->vdisplay);
++		return -EINVAL;
++	}
++	return 0;
++}
++
+ static int dm_update_plane_state(struct dc *dc,
+ 				 struct drm_atomic_commit *state,
+ 				 struct drm_plane *plane,
+@@ -14446,6 +14502,13 @@ static int dm_update_plane_state(struct dc *dc,
+ 		if (ret)
+ 			goto out;
+ 
++		if (dm_new_crtc_state->stream_peer) {
++			ret = amdgpu_dm_tiled_stitch_check_plane(new_plane_state,
++								 new_crtc_state);
++			if (ret)
++				goto out;
++		}
++
+ 		WARN_ON(dm_new_plane_state->dc_state);
+ 
+ 		dc_new_plane_state = dc_create_plane_state(dc);
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crtc.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crtc.c
+index 1a0c646..9c3c474 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crtc.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crtc.c
+@@ -682,6 +682,18 @@ static int amdgpu_dm_crtc_helper_atomic_check(struct drm_crtc *crtc,
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * Tiled stitch: a flip is programmed as two updates, one per tile
++	 * stream. An immediate (tearing) flip would tear each tile at its own
++	 * scanline; keep both halves on the vblank latch.
++	 */
++	if (crtc_state->async_flip && dm_crtc_state->stream_peer) {
++		drm_dbg_atomic(crtc->dev,
++			       "[CRTC:%d:%s] async flips are not supported on a stitched tiled display\n",
++			       crtc->base.id, crtc->name);
++		return -EINVAL;
++	}
++
+ 	if (!state->legacy_cursor_update && amdgpu_dm_crtc_vrr_active(dm_crtc_state)) {
+ 		struct drm_plane_state *primary_state;
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_plane.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_plane.c
+index a55c9e6..706aa1a 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_plane.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_plane.c
+@@ -1011,6 +1011,24 @@ static int amdgpu_dm_plane_helper_prepare_fb(struct drm_plane *plane,
+ 			afb->tmz_surface);
+ 	}
+ 
++	/*
++	 * Tiled stitch: the peer (right-tile) plane scans out the same buffer
++	 * and needs the same pinned address; without this it kept the address
++	 * computed at atomic-check time.
++	 */
++	if (dm_plane_state_new->dc_state_peer &&
++	    dm_plane_state_old->dc_state_peer != dm_plane_state_new->dc_state_peer) {
++		struct dc_plane_state *peer_state =
++			dm_plane_state_new->dc_state_peer;
++
++		amdgpu_dm_plane_fill_plane_buffer_attributes(
++			adev, afb, peer_state->format, peer_state->rotation,
++			afb->tiling_flags,
++			&peer_state->tiling_info, &peer_state->plane_size,
++			&peer_state->dcc, &peer_state->address,
++			afb->tmz_surface);
++	}
++
+ 	return 0;
+ 
+ error_unpin:
+-- 
+2.55.0
+

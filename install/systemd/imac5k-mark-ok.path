@@ -1,0 +1,8 @@
+[Unit]
+Description=Native 5K: watch for the session's "5K desktop reached" marker
+
+[Path]
+PathExistsGlob=/run/user/*/imac5k-session-ok
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=Native 5K: record that the running kernel reached a 5K desktop
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/imac5k-kmod mark-ok

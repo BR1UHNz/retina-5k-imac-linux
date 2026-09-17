@@ -1,0 +1,22 @@
+[Unit]
+Description=Build and install the native-5K amdgpu for kernel %I
+Documentation=file:/usr/local/share/imac5k/README.md
+# wl akmod first (shares the CPU, Wi-Fi may depend on it); the fan daemon must be up for a
+# multi-minute compile on this machine.
+After=network-online.target akmods@%i.service akmods.service imac-fand.service
+Wants=network-online.target imac-fand.service
+ConditionPathExists=/usr/lib/modules/%I/vmlinuz
+StartLimitIntervalSec=3h
+StartLimitBurst=8
+
+[Service]
+Type=oneshot
+# A blocked restart would otherwise leave a half-built module on the next boot; the notices
+# tell the user when it is safe again. Same pattern as akmods@ on this machine.
+ExecStart=/usr/bin/systemd-inhibit --mode=block --what=shutdown --who=iMac-5K-display-driver --why="Building the native-5K display driver for kernel %I (about 6 minutes)" /usr/local/sbin/imac5k-kmod run %I
+# 75 = transient (download, package transaction still running): retry later.
+RestartForceExitStatus=75
+RestartSec=3min
+TimeoutStartSec=60min
+Nice=10
+IOSchedulingClass=idle

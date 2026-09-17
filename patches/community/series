@@ -1,0 +1,13 @@
+# Source: github.com/MarkPronkin/imac5k-universal-linux-patcher @ c1086d2b438c800b382e111f3ce94203a4205365 (patches/), lean stack order as its Fedora backend applies it.
+imac5k-lean-core-7.2.x.patch
+imac5k-stitch-layer-7.x.patch
+5k-going-down-stop-resync.patch
+5k-post-commit-link-recovery.patch
+5k-logical-modeset-guard.patch
+5k-resume-drop-cached-peer.patch
+5k-resume-arm-link-health.patch
+imacpro-slave-dp-panel-mode.patch
+dce120-enable-crtc-reset.patch
+dce12-multisync-master-first.patch
+dce110-genlock-master-from-pipe0.patch
+5k-resync-postpone-on-modeset.patch

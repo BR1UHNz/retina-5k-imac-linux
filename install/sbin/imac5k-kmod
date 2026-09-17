@@ -1,0 +1,410 @@
+#!/usr/bin/bash
+# imac5k-kmod -- the native-5K amdgpu ("5K module") for every Fedora kernel (iMac15,1).
+#
+#   plugin-add KVER      kernel-install fast path: reinstall a cached, validated artifact (no network, no build)
+#   plugin-remove KVER   kernel-install remove: drop the module directory (state is kept until gc)
+#   queue KVER           start the background build unit for KVER
+#   run KVER             build + install for KVER (run by imac5k-build@KVER.service)
+#   catchup              at boot: account boot attempts, auto-revert, queue missing builds, gc
+#   revert KVER          put KVER back on Fedora's stock amdgpu
+#   mark-ok              record that the running kernel reached a 5K desktop (imac5k-mark-ok.path)
+#   deploy-stack DIR     install a patch stack directory (series + patches) for one kernel series
+#   status               show every installed kernel and its 5K state
+#   gc                   remove state/cache of kernels that are no longer installed
+#
+# Design rules: always the newest kernel, never pinned (no GRUB default or
+# kernel command-line changes), no dracut driver additions (the initramfs on this machine
+# carries no amdgpu), the userspace keeper stays as the fallback for a stock boot.
+set -Eeuo pipefail
+export PATH=/usr/local/sbin:/usr/sbin:/usr/bin LC_ALL=C
+
+R=${IMAC5K_ROOT:-}                     # test prefix for dry runs (never set in production)
+SHARE=$R/usr/local/share/imac5k
+STACKS=$SHARE/stack
+STATE=$R/var/lib/imac5k
+KSTATE=$STATE/kernels
+NOTICES=$STATE/notices
+CACHE=$R/var/cache/imac5k
+MODULES=$R/usr/lib/modules
+BOOT=$R/boot
+BUILDER=imac5k
+BUILDER_BIN=/usr/local/sbin/imac5k-build-module
+LOCK=${IMAC5K_LOCK:-/run/imac5k.lock}
+REVERT_AFTER_UNCONFIRMED_BOOTS=2
+
+log() { printf 'imac5k: %s\n' "$*"; }
+die() { printf 'imac5k: error: %s\n' "$*" >&2; exit 1; }
+valid_kver() { [[ $1 =~ ^[0-9][0-9A-Za-z._+-]*$ ]]; }
+series_of() { cut -d. -f1-2 <<<"$1"; }
+kdir() { printf '%s' "$KSTATE/$1"; }
+kstatus() { cut -d' ' -f1 "$(kdir "$1")/status" 2>/dev/null || echo none; }
+set_status() { mkdir -p "$(kdir "$1")"; printf '%s %s\n' "$2" "$(date -Is)" > "$(kdir "$1")/status"; }
+stock_module() { local f=$MODULES/$1/kernel/drivers/gpu/drm/amd/amdgpu/amdgpu.ko.xz; [[ -f $f ]] && printf '%s' "$f"; }
+our_module() { printf '%s' "$MODULES/$1/updates/imac5k/amdgpu.ko.xz"; }
+kernel_installed() { [[ -f $MODULES/$1/vmlinuz ]]; }
+installed_kernels() { local d; for d in "$MODULES"/*/; do d=${d%/}; [[ -f $d/vmlinuz ]] && basename "$d"; done | sort -V; }
+newest_kernel() { installed_kernels | tail -1; }
+stack_dir() { local d; d=$STACKS/$(series_of "$1"); [[ -f $d/series && -f $d/STACK_ID ]] && printf '%s' "$d"; }
+stack_id() { cat "$1/STACK_ID"; }
+lock() { exec 9>"$LOCK"; flock 9; }
+trylock() { exec 9>"$LOCK"; flock -w "$1" 9; }
+running_patched() { [[ -e /sys/module/amdgpu/parameters/tiled_stitch ]]; }
+
+# --- notifications: to every graphical session now, else queued for the next login ---
+notify() {  # urgency summary body
+    local urgency=$1 summary=$2 body=$3 delivered=0 sid user
+    log "notice ($urgency): $summary -- $body"
+    [[ -z $R ]] || return 0
+    while read -r sid _ user _; do
+        [[ $(loginctl show-session "$sid" -p Type --value 2>/dev/null) =~ ^(wayland|x11)$ ]] || continue
+        systemd-run --quiet --collect --no-block --machine="$user@.host" --user \
+            /usr/bin/notify-send --app-name="iMac 5K display" --icon=video-display \
+            --urgency="$urgency" "$summary" "$body" 2>/dev/null && delivered=1
+    done < <(loginctl list-sessions --no-legend 2>/dev/null)
+    if (( ! delivered )); then
+        mkdir -p "$NOTICES"
+        printf '%s\n%s\n%s\n' "$urgency" "$summary" "$body" > "$NOTICES/$(date +%s%N)"
+    fi
+}
+
+# --- the only gate between a build (or a cached artifact) and /usr/lib/modules ---
+module_ok() {  # KVER FILE
+    local kver=$1 f=$2 stock vm
+    stock=$(stock_module "$kver") || return 1
+    vm=$(modinfo -F vermagic "$f" 2>/dev/null) || return 1
+    [[ $vm == "$(modinfo -F vermagic "$stock")" && ${vm%% *} == "$kver" ]] || return 1
+    [[ $(modinfo -F name "$f") == amdgpu ]] || return 1
+    modinfo -F parm "$f" | grep '^tiled_stitch:' >/dev/null || return 1
+    [[ $(modinfo -F depends "$f" | tr , '\n' | sort) == \
+       "$(modinfo -F depends "$stock" | tr , '\n' | sort)" ]] || return 1
+    # The in-kernel XZ decoder accepts CRC32 only.
+    [[ $(xz --robot --list "$f" | awk -F'\t' '$1 == "file" { print $7 }') == CRC32 ]]
+}
+
+# No "grep -q" after these pipes: an early exit SIGPIPEs lsinitrd and pipefail turns a match into a failure.
+initramfs_lists() { [[ -f $BOOT/initramfs-$1.img ]] && lsinitrd "$BOOT/initramfs-$1.img" 2>/dev/null | grep -- "$2" >/dev/null; }
+initramfs_has_amdgpu() { initramfs_lists "$1" '/amdgpu\.ko'; }
+initramfs_has_ours() { initramfs_lists "$1" 'updates/imac5k/amdgpu\.ko'; }
+
+# Fedora's host-only initramfs carries amdgpu (Plymouth), so the module that boots is the one dracut
+# packed: regenerate whenever the initramfs carries amdgpu, and verify which one it packed.
+# regen_initramfs KVER expect-ours(1|0) -> 0 ok, 1 wrong module inside
+regen_initramfs() {
+    local kver=$1 want=$2
+    initramfs_has_amdgpu "$kver" || return 0
+    log "initramfs for $kver carries amdgpu; regenerating"
+    [[ -n $R ]] || dracut -f --kver "$kver" "$BOOT/initramfs-$kver.img" >/dev/null 2>&1 || { log "dracut failed for $kver"; return 1; }
+    [[ -n $R ]] || sync -f "$BOOT"
+    if (( want )); then initramfs_has_ours "$kver"; else ! initramfs_has_ours "$kver"; fi
+}
+
+depmod_kver() { [[ -n $R ]] || depmod -a "$1"; }
+
+# install_artifact KVER FILE STACK_ID -- validate, install, depmod, cache
+install_artifact() {
+    local kver=$1 src=$2 sid=$3 dest tmp kd
+    dest=$(our_module "$kver"); kd=$(kdir "$kver")
+    module_ok "$kver" "$src" || { log "artifact for $kver rejected by module_ok"; return 1; }
+    mkdir -p "$kd"
+    install -D -m 0644 "$src" "$dest.new"
+    mv -f "$dest.new" "$dest"
+    [[ -n $R ]] || restorecon -RF "$(dirname "$dest")" 2>/dev/null || true
+    depmod_kver "$kver"
+    if [[ -z $R && $(realpath "$(modinfo -k "$kver" -n amdgpu)") != "$(realpath "$dest")" ]]; then
+        rm -f "$dest"; depmod_kver "$kver"
+        log "depmod does not resolve amdgpu to the 5K module for $kver; removed it again"
+        return 1
+    fi
+    if ! regen_initramfs "$kver" 1; then
+        log "the initramfs for $kver did not pick up the 5K module; reverting to stock"
+        rm -rf "$MODULES/$kver/updates/imac5k"; depmod_kver "$kver"; regen_initramfs "$kver" 0 || true
+        return 1
+    fi
+    # keep the validated artifact so a kernel reinstall / dracut regeneration can restore it instantly
+    [[ $(realpath "$src") == "$(realpath "$kd/amdgpu.ko.xz")" ]] || install -m 0644 "$src" "$kd/amdgpu.ko.xz"
+    printf 'stack=%s\nsha256=%s\nsymvers=%s\n' "$sid" "$(sha256sum < "$dest" | cut -c1-64)" \
+        "$(xz -dc "$MODULES/$kver/symvers.xz" 2>/dev/null | sha256sum | cut -c1-16)" > "$kd/manifest"
+    printf '%s\n' "$sid" > "$kd/stack"
+    rm -f "$kd/attempts" "$kd/failstack"
+    set_status "$kver" installed
+    log "installed $dest (stack $sid)"
+}
+
+remove_module() {  # KVER -- back to stock for this kernel
+    local kver=$1
+    rm -rf "$MODULES/$kver/updates/imac5k"
+    kernel_installed "$kver" || return 0
+    depmod_kver "$kver"
+    regen_initramfs "$kver" 0 || notify critical "Native 5K: initramfs for $kver still carries the 5K module" "Regenerate it by hand: sudo dracut -f --kver $kver"
+}
+
+manifest_get() { sed -n "s/^$2=//p" "$(kdir "$1")/manifest" 2>/dev/null; }
+
+cached_artifact_ok() {  # KVER STACK_ID -> path or fail
+    local kver=$1 sid=$2 kd; kd=$(kdir "$kver")
+    [[ -f $kd/amdgpu.ko.xz && $(manifest_get "$kver" stack) == "$sid" ]] || return 1
+    [[ $(manifest_get "$kver" symvers) == "$(xz -dc "$MODULES/$kver/symvers.xz" 2>/dev/null | sha256sum | cut -c1-16)" ]] || return 1
+    module_ok "$kver" "$kd/amdgpu.ko.xz" || return 1
+    printf '%s' "$kd/amdgpu.ko.xz"
+}
+
+# --- subcommands ------------------------------------------------------------------------
+cmd_plugin_add() {   # sub-second, no network, never fails the kernel-install
+    local kver=$1 sd sid art
+    valid_kver "$kver" || exit 0
+    trylock 20 || exit 0
+    sd=$(stack_dir "$kver") || exit 0
+    sid=$(stack_id "$sd")
+    if [[ -f $(our_module "$kver") ]] && module_ok "$kver" "$(our_module "$kver")"; then
+        exit 0    # already there (dnf reinstall keeps our unowned file only if remove did not run)
+    fi
+    art=$(cached_artifact_ok "$kver" "$sid") || exit 0
+    log "restoring the cached 5K module for $kver"
+    install -D -m 0644 "$art" "$(our_module "$kver")"
+    [[ -n $R ]] || restorecon -RF "$(dirname "$(our_module "$kver")")" 2>/dev/null || true
+    printf '%s\n' "$sid" > "$(kdir "$kver")/stack"
+    set_status "$kver" installed
+    # 50-depmod.install and 50-dracut.install run right after this plugin and pack the module that depmod resolves.
+}
+
+cmd_plugin_remove() {
+    local kver=$1
+    valid_kver "$kver" || exit 0
+    trylock 20 || exit 0
+    rm -rf "$MODULES/$kver/updates/imac5k"
+    rm -rf "$CACHE/work/$kver"
+}
+
+cmd_queue() {
+    local kver=$1
+    valid_kver "$kver" || die "bad kernel version"
+    rm -f "$(kdir "$kver")/failstack"
+    if [[ -n $R ]]; then log "(dry run) would start imac5k-build@$kver.service"; return 0; fi
+    systemctl start --no-block "imac5k-build@$(systemd-escape "$kver").service"
+}
+
+wait_for_devel() {  # KVER -- kernel-devel lands in the same dnf transaction; wait for it, never call dnf inside one
+    local kver=$1 i
+    for ((i = 0; i < 40; i++)); do
+        [[ -f $R/usr/src/kernels/$kver/Module.symvers && -f $R/usr/src/kernels/$kver/.config ]] && return 0
+        (( i == 0 )) && log "waiting for kernel-devel-$kver"
+        sleep 15
+    done
+    [[ -n $R ]] && return 1
+    if pgrep -x dnf5 >/dev/null || pgrep -x dnf >/dev/null || pgrep -x packagekitd >/dev/null; then
+        log "a package transaction is still running; will retry"
+        return 75
+    fi
+    log "installing kernel-devel-$kver"
+    dnf -y -q install "kernel-devel-$kver" || return 75
+    [[ -f $R/usr/src/kernels/$kver/Module.symvers ]]
+}
+
+cmd_run() {
+    local kver=$1 sd sid art work rc
+    valid_kver "$kver" || die "bad kernel version"
+    lock
+    kernel_installed "$kver" || { log "$kver is not installed"; return 0; }
+    sd=$(stack_dir "$kver") || {
+        local series shash; series=$(series_of "$kver"); shash=$(ls "$STACKS" 2>/dev/null | sha256sum | cut -c1-16)
+        set_status "$kver" unsupported
+        if [[ $(cat "$(kdir "$kver")/unsupported" 2>/dev/null) != "$shash" ]]; then
+            printf '%s\n' "$shash" > "$(kdir "$kver")/unsupported"
+            [[ $kver == "$(newest_kernel)" ]] && notify critical "Native 5K needs a patch port for kernel $series" \
+                "Kernel $kver is newer than the 5K patch stacks installed ($(ls -m "$STACKS" 2>/dev/null)). It boots with the stock driver and the two-output keeper until the stack is ported (see /usr/local/share/imac5k/README.md)."
+        fi
+        return 0
+    }
+    sid=$(stack_id "$sd")
+    if [[ -f $(our_module "$kver") && $(cat "$(kdir "$kver")/stack" 2>/dev/null) == "$sid" ]] && module_ok "$kver" "$(our_module "$kver")"; then
+        set_status "$kver" installed; log "$kver already has the 5K module for stack $sid"; return 0
+    fi
+    if art=$(cached_artifact_ok "$kver" "$sid"); then
+        log "installing the cached artifact for $kver"; install_artifact "$kver" "$art" "$sid"; return 0
+    fi
+    if [[ $(cat "$(kdir "$kver")/failstack" 2>/dev/null) == "$sid" ]]; then
+        log "$kver already failed with stack $sid; not retrying until the stack changes or 'imac5k-kmod queue $kver'"; return 0
+    fi
+    stock_module "$kver" >/dev/null || { set_status "$kver" failed:no-stock-module; return 0; }
+    set_status "$kver" building
+    wait_for_devel "$kver"; rc=$?
+    if (( rc == 75 )); then set_status "$kver" waiting:devel; return 75; fi
+    if (( rc != 0 )); then set_status "$kver" failed:devel; notify critical "Native 5K: no kernel-devel for $kver" "kernel-devel-$kver is not installed, so the 5K driver cannot be built. Install it and run: sudo imac5k-kmod queue $kver"; return 0; fi
+    if ! cmp -s <(xz -dc "$MODULES/$kver/symvers.xz") "$R/usr/src/kernels/$kver/Module.symvers"; then
+        set_status "$kver" failed:devel-mismatch
+        notify critical "Native 5K: kernel-devel mismatch for $kver" "kernel-devel-$kver does not match the installed kernel (symvers differ). The stock driver stays. Reinstall kernel-devel and run: sudo imac5k-kmod queue $kver"
+        return 0
+    fi
+
+    notify normal "Building the native 5K display driver for kernel $kver" "About 6 minutes. Please do not restart until the 'ready' notice appears (a restart is held back meanwhile)."
+    mkdir -p "$CACHE/srpms" "$CACHE/work"; chown -R "$BUILDER:$BUILDER" "$CACHE"
+    work=$CACHE/work/$kver; rm -rf "$work"; install -d -o "$BUILDER" -g "$BUILDER" "$work"
+    log "fetching the source rpm for $kver"
+    runuser -u "$BUILDER" -- "$BUILDER_BIN" fetch "$kver" "$CACHE/srpms"; rc=$?
+    if (( rc != 0 )); then set_status "$kver" waiting:fetch; log "fetch failed (rc=$rc); will retry"; return 75; fi
+    log "building amdgpu for $kver with stack $sid"
+    runuser -u "$BUILDER" -- "$BUILDER_BIN" build "$kver" "$CACHE/srpms" "$work" "$sd"; rc=$?
+    rm -rf "$work/rpmbuild"
+    case $rc in
+        0) ;;
+        2) set_status "$kver" failed:patch; printf '%s\n' "$sid" > "$(kdir "$kver")/failstack"; rm -rf "$work"
+           notify critical "Native 5K patches do not apply to kernel $kver" "That kernel keeps the stock driver (4K + the two-output keeper). The 5K patch stack needs a port; details: journalctl -u imac5k-build@$kver"
+           return 0 ;;
+        *) set_status "$kver" failed:build; printf '%s\n' "$sid" > "$(kdir "$kver")/failstack"; rm -rf "$work"
+           notify critical "Native 5K driver failed to compile for kernel $kver" "That kernel keeps the stock driver (4K + the two-output keeper). Details: journalctl -u imac5k-build@$kver"
+           return 0 ;;
+    esac
+    # Root only ever copies the small artifact, and only after module_ok passes.
+    [[ -f $work/amdgpu.ko.xz ]] || { set_status "$kver" failed:build; return 0; }
+    if ! install_artifact "$kver" "$work/amdgpu.ko.xz" "$sid"; then
+        set_status "$kver" failed:install; printf '%s\n' "$sid" > "$(kdir "$kver")/failstack"; rm -rf "$work"
+        notify critical "Native 5K driver rejected for kernel $kver" "The built module did not pass validation; the stock driver stays. Details: journalctl -u imac5k-build@$kver"
+        return 0
+    fi
+    rm -rf "$work"
+    if [[ $kver == "$(uname -r)" ]]; then
+        notify normal "Native 5K driver ready for kernel $kver" "It takes effect at the next restart (safe to restart now)."
+    else
+        notify normal "Native 5K driver ready for kernel $kver" "It is used automatically when you restart into $kver (safe to restart now)."
+    fi
+    cmd_gc
+}
+
+cmd_revert() {
+    local kver=$1
+    valid_kver "$kver" || die "bad kernel version"
+    lock
+    remove_module "$kver"
+    set_status "$kver" reverted
+    log "$kver is back on the stock amdgpu from its next boot (the 5K keeper covers it); re-enable with: imac5k-kmod queue $kver"
+}
+
+cmd_mark_ok() {
+    local kver sid f
+    kver=$(uname -r)
+    lock
+    for f in /run/user/*/imac5k-session-ok; do [[ -e $f ]] && rm -f "$f"; done
+    running_patched || return 0
+    sid=$(cat "$(kdir "$kver")/stack" 2>/dev/null || echo unknown)
+    mkdir -p "$(kdir "$kver")"
+    printf '%s %s\n' "$sid" "$(date -Is)" > "$(kdir "$kver")/bootok"
+    rm -f "$(kdir "$kver")/attempts"
+    log "$kver confirmed: 5K desktop reached with stack $sid"
+}
+
+cmd_catchup() {
+    local running kver sd sid newest att
+    lock
+    running=$(uname -r)
+    # Boot accounting for the running kernel: N consecutive boots with the 5K module loaded but no
+    # confirmed 5K desktop -> that kernel goes back to stock (never the GRUB default, only its module).
+    if [[ -z $R ]] && running_patched && [[ -f $(our_module "$running") ]]; then
+        att=$(( $(cat "$(kdir "$running")/attempts" 2>/dev/null || echo 0) + 1 ))
+        mkdir -p "$(kdir "$running")"; printf '%s\n' "$att" > "$(kdir "$running")/attempts"
+        if (( att >= REVERT_AFTER_UNCONFIRMED_BOOTS )); then
+            remove_module "$running"; set_status "$running" reverted; rm -f "$(kdir "$running")/attempts"
+            notify critical "Native 5K driver disabled for kernel $running" \
+                "$att boots in a row never reached a working 5K desktop, so this kernel uses the stock driver from its next restart. To try again: sudo imac5k-kmod queue $running"
+        fi
+    fi
+    newest=$(newest_kernel)
+    for kver in $(installed_kernels); do
+        if ! sd=$(stack_dir "$kver"); then
+            # No stack for this series. The newest kernel gets one run (it raises the "needs a port"
+            # notice); older ones are simply recorded as unsupported.
+            [[ $(kstatus "$kver") == unsupported ]] && continue
+            if [[ $kver == "$newest" ]]; then cmd_queue "$kver"; else set_status "$kver" unsupported; fi
+            continue
+        fi
+        sid=$(stack_id "$sd")
+        [[ -f $(our_module "$kver") && $(cat "$(kdir "$kver")/stack" 2>/dev/null) == "$sid" ]] && continue
+        [[ $(kstatus "$kver") == reverted ]] && continue
+        [[ $(cat "$(kdir "$kver")/failstack" 2>/dev/null) == "$sid" ]] && continue
+        # Rollout: a new stack goes to the newest kernel first; older ones follow once it is confirmed.
+        if [[ $kver != "$newest" && $(cut -d' ' -f1 "$(kdir "$newest")/bootok" 2>/dev/null) != "$sid" ]]; then
+            log "$kver waits for $newest to confirm stack $sid"; continue
+        fi
+        cmd_queue "$kver"
+    done
+    cmd_gc
+}
+
+cmd_gc() {
+    local d kver f
+    for d in "$KSTATE"/*/ "$CACHE"/work/*/; do
+        [[ -d $d ]] || continue
+        kver=$(basename "${d%/}")
+        kernel_installed "$kver" && continue
+        rm -rf "$d"
+    done
+    for d in "$MODULES"/*/updates/imac5k; do
+        [[ -d $d ]] || continue
+        kver=$(basename "$(dirname "$(dirname "$d")")")
+        kernel_installed "$kver" && continue
+        rm -rf "$d"
+    done
+    for f in "$R"/etc/depmod.d/imac5k-*.conf; do [[ -f $f ]] && rm -f "$f"; done   # legacy per-kernel overrides
+    find "$NOTICES" -type f -mtime +30 -delete 2>/dev/null || true
+    # one source rpm per installed kernel is enough
+    for f in "$CACHE"/srpms/kernel-*.src.rpm; do
+        [[ -f $f ]] || continue
+        kver=$(basename "$f" .src.rpm); kver=${kver#kernel-}.x86_64
+        kernel_installed "$kver" || rm -f "$f"
+    done
+    true
+}
+
+cmd_deploy_stack() {  # DIR containing series + patches; installs as stack/<series>
+    local src=$1 series p tmp dst
+    [[ -f $src/series && -f $src/SERIES ]] || die "$src needs a 'series' (patch list) and 'SERIES' (kernel series, e.g. 7.2)"
+    series=$(tr -d '[:space:]' < "$src/SERIES"); [[ $series =~ ^[0-9]+\.[0-9]+$ ]] || die "bad SERIES"
+    lock
+    tmp=$(mktemp -d "$STACKS/.new-$series.XXXXXX" 2>/dev/null || { mkdir -p "$STACKS"; mktemp -d "$STACKS/.new-$series.XXXXXX"; })
+    while read -r p; do
+        [[ -z $p || $p == \#* ]] && continue
+        [[ $p =~ ^[A-Za-z0-9._-]+\.patch$ ]] || die "bad patch name: $p"
+        [[ -f $src/$p ]] || die "missing patch $p"
+        install -m 0644 "$src/$p" "$tmp/$p"
+    done < "$src/series"
+    install -m 0644 "$src/series" "$tmp/series"
+    (cd "$tmp" && { cat series; while read -r p; do [[ -z $p || $p == \#* ]] || cat "$p"; done < series; } | sha256sum | cut -c1-16) > "$tmp/STACK_ID"
+    chmod 0755 "$tmp"; dst=$STACKS/$series
+    rm -rf "$dst.old"; [[ -d $dst ]] && mv "$dst" "$dst.old"; mv "$tmp" "$dst"; rm -rf "$dst.old"
+    [[ -n $R ]] || restorecon -RF "$STACKS" 2>/dev/null || true
+    log "stack $series installed: id $(cat "$dst/STACK_ID") ($(grep -cv '^#' "$dst/series") patches)"
+    exec 9>&-
+    cmd_catchup
+}
+
+cmd_status() {
+    local kver sd sid st ours run mark
+    run=$(uname -r)
+    printf '%-28s %-9s %-16s %-10s %-10s %s\n' KERNEL STACK MODULE STATUS BOOT-OK NOTE
+    for kver in $(installed_kernels); do
+        mark=' '; [[ $kver == "$run" ]] && mark='*'
+        if sd=$(stack_dir "$kver"); then sid=$(stack_id "$sd"); else sid=-; fi
+        if [[ -f $(our_module "$kver") ]]; then ours="5K($(cat "$(kdir "$kver")/stack" 2>/dev/null || echo '?'))"; else ours=stock; fi
+        st=$(kstatus "$kver")
+        printf '%s%-27s %-9s %-16s %-10s %-10s %s\n' "$mark" "$kver" "$sid" "$ours" "$st" \
+            "$(cut -d' ' -f1 "$(kdir "$kver")/bootok" 2>/dev/null || echo -)" \
+            "$([[ -f $(kdir "$kver")/attempts ]] && printf 'unconfirmed boots: %s' "$(cat "$(kdir "$kver")/attempts")")"
+    done
+    if [[ -z $R ]]; then
+        printf '\nrunning kernel %s: %s\n' "$run" "$(running_patched && echo '5K module loaded' || echo 'stock amdgpu loaded')"
+        printf 'keeper: %s\n' "$(systemctl is-active imac5k-wake.service 2>/dev/null || true)"
+    fi
+}
+
+case ${1:-} in
+    plugin-add)    cmd_plugin_add "${2:?KVER}" ;;
+    plugin-remove) cmd_plugin_remove "${2:?KVER}" ;;
+    queue)         cmd_queue "${2:?KVER}" ;;
+    run)           cmd_run "${2:?KVER}" ;;
+    catchup)       cmd_catchup ;;
+    revert)        cmd_revert "${2:?KVER}" ;;
+    mark-ok)       cmd_mark_ok ;;
+    deploy-stack)  cmd_deploy_stack "${2:?DIR}" ;;
+    status)        cmd_status ;;
+    gc)            lock; cmd_gc ;;
+    *) sed -n '2,14p' "$0"; exit 2 ;;
+esac

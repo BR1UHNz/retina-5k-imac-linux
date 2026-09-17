@@ -1,0 +1,118 @@
+From 2d62bf5070afdb9b933726766b5f663ab404ac81 Mon Sep 17 00:00:00 2001
+From: br1uhnz <br1uhnz@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 22:01:26 -0500
+Subject: [PATCH] drm/amd/display: report timing-synchronized displays to
+ PowerPlay on DCE 10
+
+smu7 (Tonga) refuses MCLK switching whenever more than one display is active
+unless the display configuration says all displays are in sync
+(smu7_hwmgr.c: disable_mclk_switching_for_display). DC derives that flag in
+bw_calcs() for DCE 11+, but dce100_validate_bandwidth() hard-codes its
+bandwidth output and never sets bw_ctx.bw.dce.all_displays_in_sync, and the
+DCE 10 clock manager (dce100/dce_clk_mgr.c) never copies it into
+pp_display_cfg either. So on DCE 10 any two-stream configuration pins MCLK at
+its top level.
+
+On an iMac15,1 (Radeon R9 M295X) the native 5K panel is two 2560x2880 tile
+streams from one clock source (0.0 ppm, phase within ~2 lines). Measured with
+both tiles lit on the stock driver: mclk pinned at 1362 MHz, ~48 W GPU power
+at 0 % load, 83 C, fan 2039 RPM; with one stream: ~15 W, mclk 143 MHz.
+
+Compute the flag on DCE 10 exactly like bw_calcs() does (all OPP-head streams
+pairwise resource_are_streams_timing_synchronizable(), gated by
+dc->config.multi_mon_pp_mclk_switch, i.e. amdgpu.dcfeaturemask bit 1, on by
+default) and hand it to PowerPlay. The other smu7 gate, the minimum vblank
+time (450 us for GDDR5), is already satisfied by the tile timing
+(2720 x 82 lines / 483.25 MHz = 461.5 us).
+
+Not Apple-specific: any DCE 10 board with two identical-timing displays gets
+MCLK switching back, which is what DCE 11+ already do.
+
+Hardware verification: with both tiles lit and the desktop idle, pp_dpm_mclk
+must show 143 MHz selected and power1_average well below 20 W; watch for
+memory-underflow flicker on either tile when MCLK switches (escape hatch:
+amdgpu.dcfeaturemask=0 restores the pinned behaviour).
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../display/dc/clk_mgr/dce100/dce_clk_mgr.c   |  7 ++++
+ .../dc/resource/dce100/dce100_resource.c      | 38 +++++++++++++++++++
+ 2 files changed, 45 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/clk_mgr/dce100/dce_clk_mgr.c b/drivers/gpu/drm/amd/display/dc/clk_mgr/dce100/dce_clk_mgr.c
+index d891b3b..2ca920d 100644
+--- a/drivers/gpu/drm/amd/display/dc/clk_mgr/dce100/dce_clk_mgr.c
++++ b/drivers/gpu/drm/amd/display/dc/clk_mgr/dce100/dce_clk_mgr.c
+@@ -321,6 +321,13 @@ static void dce_pplib_apply_display_requirements(
+ 	struct dm_pp_display_configuration *pp_display_cfg = &context->pp_display_cfg;
+ 
+ 	dce110_fill_display_configs(context, pp_display_cfg);
++	/*
++	 * Without this PowerPlay never learns that the displays are in sync and
++	 * pins MCLK whenever more than one is active (see
++	 * dce100_validate_bandwidth(), which computes the flag on DCE 10).
++	 */
++	pp_display_cfg->all_displays_in_sync =
++		context->bw_ctx.bw.dce.all_displays_in_sync;
+ 
+ 	if (memcmp(&dc->current_state->pp_display_cfg, pp_display_cfg, sizeof(*pp_display_cfg)) !=  0)
+ 		dm_pp_apply_display_requirements(dc->ctx, pp_display_cfg);
+diff --git a/drivers/gpu/drm/amd/display/dc/resource/dce100/dce100_resource.c b/drivers/gpu/drm/amd/display/dc/resource/dce100/dce100_resource.c
+index 97ea22a..1ec7c60 100644
+--- a/drivers/gpu/drm/amd/display/dc/resource/dce100/dce100_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/resource/dce100/dce100_resource.c
+@@ -863,6 +863,41 @@ static enum dc_status build_mapped_resource(
+ 	return DC_OK;
+ }
+ 
++/*
++ * PowerPlay (smu7) only allows MCLK switching with more than one active
++ * display when DC reports them as timing-synchronized
++ * (dm_pp_display_configuration.all_displays_in_sync); otherwise it pins MCLK
++ * at its top level. DCE 11+ derive that flag in bw_calcs(); DCE 10 hard-codes
++ * its bandwidth numbers and never sets it, so every two-stream configuration
++ * pins MCLK. Measured on an iMac15,1 (Tonga) whose 5K panel is driven as two
++ * 2560x2880 tile streams from one clock source: ~48 W at idle instead of
++ * ~15 W, GPU at 83 C. Derive the flag exactly like bw_calcs() does.
++ */
++static bool dce100_all_displays_in_sync(const struct dc *dc,
++					const struct dc_state *context)
++{
++	const struct dc_stream_state *first = NULL;
++	int i;
++
++	if (!dc->config.multi_mon_pp_mclk_switch)
++		return false;
++
++	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++		const struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++
++		if (!resource_is_pipe_type(pipe, OPP_HEAD))
++			continue;
++
++		if (!first)
++			first = pipe->stream;
++		else if (!resource_are_streams_timing_synchronizable(
++				(struct dc_stream_state *)first, pipe->stream))
++			return false;
++	}
++
++	return first != NULL;
++}
++
+ enum dc_status dce100_validate_bandwidth(
+ 	struct dc  *dc,
+ 	struct dc_state *context,
+@@ -884,6 +919,9 @@ enum dc_status dce100_validate_bandwidth(
+ 		}
+ 	}
+ 
++	context->bw_ctx.bw.dce.all_displays_in_sync =
++		dce100_all_displays_in_sync(dc, context);
++
+ 	if (at_least_one_pipe) {
+ 		/* TODO implement when needed but for now hardcode max value*/
+ 		context->bw_ctx.bw.dce.dispclk_khz = 681000;
+-- 
+2.55.0
+

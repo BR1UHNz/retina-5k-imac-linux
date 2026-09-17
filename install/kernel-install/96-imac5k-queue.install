@@ -1,0 +1,9 @@
+#!/usr/bin/bash
+# Queue the background build of the 5K module for a newly installed kernel (after akmods).
+COMMAND=${1-} KVER=${2-}
+[[ $COMMAND == add && -x /usr/local/sbin/imac5k-kmod && -d /run/systemd/system ]] || exit 0
+if [[ ! -f /usr/lib/modules/$KVER/updates/imac5k/amdgpu.ko.xz ]]; then
+    timeout 30 /usr/local/sbin/imac5k-kmod queue "$KVER" || true
+    echo "imac5k: building the native-5K display driver for $KVER in the background (~6 min); a desktop notice appears when it is ready" >&2
+fi
+exit 0

@@ -1,0 +1,59 @@
+#!/usr/bin/bash
+# imac5k-build-module -- unprivileged half of imac5k-kmod (runs as the 'imac5k' user).
+#   fetch KVER SRPMDIR                 download + verify the exact Fedora source rpm (network)
+#   build KVER SRPMDIR WORKDIR STACKDIR prepare the Fedora tree, apply the stack, compile, strip, xz
+# Exit: 0 ok; 2 = a patch does not apply (final for this stack); 3 = compile/other failure.
+set -Eeuo pipefail
+export PATH=/usr/bin:/usr/sbin LC_ALL=C HOME=/var/cache/imac5k
+cmd=${1:?}; kver=${2:?}
+[[ $kver =~ ^[0-9][0-9A-Za-z._+-]*$ ]] || exit 3
+nvr=kernel-${kver%.x86_64}
+srpm=$nvr.src.rpm
+fedora_keyid() { rpm -q gpg-pubkey --qf '%{version} %{summary}\n' | awk -v n="$(rpm -E %fedora)" '$0 ~ "Fedora \\(" n "\\)" { print substr($1, length($1)-7) }' | head -1; }
+
+case $cmd in
+fetch)
+    dl=${3:?}; cd "$dl"
+    if [[ -f $srpm ]] && rpmkeys -K --define '_pkgverify_level signature' "$srpm" >/dev/null 2>&1; then
+        echo "source rpm already present and verified"; exit 0
+    fi
+    key=$(fedora_keyid); [[ -n $key ]] || { echo "no Fedora key in the rpmdb"; exit 3; }
+    tmp=$(mktemp -d "$dl/.dl.XXXXXX"); trap 'rm -rf "$tmp"' EXIT
+    ( cd "$tmp" && koji download-build --noprogress --arch=src --key="$key" "$nvr" ) || { echo "koji download failed"; exit 3; }
+    [[ -f $tmp/$srpm ]] || { echo "koji did not deliver $srpm"; exit 3; }
+    rpmkeys -K --define '_pkgverify_level signature' "$tmp/$srpm" || { echo "signature check failed for $srpm"; exit 3; }
+    mv -f "$tmp/$srpm" "$dl/$srpm"; echo "downloaded and verified $srpm"
+    ;;
+build)
+    dl=${3:?}; work=${4:?}; stack=${5:?}
+    top=$work/rpmbuild; mkdir -p "$top"
+    rpm -i --define "_topdir $top" "$dl/$srpm" || exit 3
+    echo "preparing the Fedora source tree (rpmbuild -bp)"
+    rpmbuild -bp --nodeps --target x86_64 --without debug --without debuginfo \
+        --define "_topdir $top" "$top/SPECS/kernel.spec" > "$work/rpmbuild-bp.log" 2>&1 || { tail -30 "$work/rpmbuild-bp.log"; exit 3; }
+    mapfile -t mk < <(find "$top/BUILD" -path '*/drivers/gpu/drm/amd/amdgpu/Makefile')
+    (( ${#mk[@]} == 1 )) || { echo "expected one prepared tree, found ${#mk[@]}"; exit 3; }
+    src=${mk[0]%/drivers/gpu/drm/amd/amdgpu/Makefile}
+    while read -r p; do
+        [[ -z $p || $p == \#* ]] && continue
+        [[ $p =~ ^[A-Za-z0-9._-]+\.patch$ ]] || exit 2
+        if ! patch -d "$src" -p1 --batch --forward --fuzz=0 --dry-run < "$stack/$p" > "$work/patch.log" 2>&1; then
+            echo "patch $p does not apply:"; tail -20 "$work/patch.log"; exit 2
+        fi
+        patch -d "$src" -p1 --batch --forward --fuzz=0 -s < "$stack/$p" || exit 2
+        echo "applied $p"
+    done < "$stack/series"
+    echo "compiling amdgpu (this takes a few minutes)"
+    env -i PATH=/usr/bin:/usr/sbin HOME=$HOME LC_ALL=C \
+        make -s -C "/usr/src/kernels/$kver" -j"$(nproc)" M="$src/drivers/gpu/drm/amd/amdgpu" \
+        "CFLAGS_amdgpu_trace_points.o=-I$src/include/trace" modules > "$work/make.log" 2>&1 ||
+        { grep -E -m 30 'error|Error' "$work/make.log"; exit 3; }
+    grep -q 'undefined!' "$work/make.log" && { echo "modpost reported undefined symbols"; exit 3; }
+    ko=$src/drivers/gpu/drm/amd/amdgpu/amdgpu.ko; [[ -f $ko ]] || exit 3
+    cp "$ko" "$work/amdgpu.ko" && strip --strip-debug "$work/amdgpu.ko"
+    xz -T1 --check=crc32 --lzma2=dict=1MiB -c "$work/amdgpu.ko" > "$work/amdgpu.ko.xz"
+    rm -f "$work/amdgpu.ko"; rm -rf "$top"
+    echo "built $(du -h "$work/amdgpu.ko.xz" | cut -f1) amdgpu.ko.xz"
+    ;;
+*) exit 3 ;;
+esac

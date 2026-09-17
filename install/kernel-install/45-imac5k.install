@@ -1,0 +1,10 @@
+#!/usr/bin/bash
+# Fast path: restore a cached, validated 5K module for this kernel before 50-depmod runs.
+# MUST NEVER FAIL: kernel-install stops at the first plugin that exits non-zero.
+COMMAND=${1-} KVER=${2-}
+[[ -x /usr/local/sbin/imac5k-kmod && -d /run/systemd/system ]] || exit 0
+case $COMMAND in
+    add)    timeout 60 /usr/local/sbin/imac5k-kmod plugin-add "$KVER" || echo "imac5k: fast path skipped for $KVER" >&2 ;;
+    remove) timeout 60 /usr/local/sbin/imac5k-kmod plugin-remove "$KVER" || true ;;
+esac
+exit 0

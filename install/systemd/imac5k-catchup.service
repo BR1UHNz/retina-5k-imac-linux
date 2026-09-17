@@ -1,0 +1,12 @@
+[Unit]
+Description=Native 5K: boot accounting, auto-revert and queued builds for kernels without the 5K module
+Documentation=file:/usr/local/share/imac5k/README.md
+After=network-online.target akmods.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/imac5k-kmod catchup
+
+[Install]
+WantedBy=multi-user.target

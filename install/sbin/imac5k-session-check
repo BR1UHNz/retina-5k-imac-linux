@@ -1,0 +1,43 @@
+#!/usr/bin/bash
+# imac5k-session-check -- runs in the user's Plasma session: replays queued notices, then confirms
+# the stitched 5K panel is active on this boot (writes $XDG_RUNTIME_DIR/imac5k-session-ok, which
+# imac5k-mark-ok.path turns into the kernel's boot-ok record).
+set -uo pipefail
+seen=${XDG_STATE_HOME:-$HOME/.local/state}/imac5k/notices-seen
+mkdir -p "${seen%/*}"; last=$(cat "$seen" 2>/dev/null || echo 0)
+for n in /var/lib/imac5k/notices/*; do
+    [[ -f $n ]] || continue
+    stamp=${n##*/}; [[ $stamp > $last ]] || continue
+    { read -r urgency; read -r summary; read -r body; } < "$n"
+    notify-send --app-name="iMac 5K display" --icon=video-display --urgency="$urgency" "$summary" "$body"
+    last=$stamp
+done
+printf '%s\n' "$last" > "$seen"
+
+kver=$(uname -r)
+status=$(cut -d' ' -f1 "/var/lib/imac5k/kernels/$kver/status" 2>/dev/null || echo none)
+if [[ ! -e /sys/module/amdgpu/parameters/tiled_stitch ]]; then
+    [[ $status == installed ]] && notify-send --app-name="iMac 5K display" --icon=video-display --urgency=critical \
+        "5K driver installed for $kver but not loaded" "The stock amdgpu is running (two-output keeper mode). Check: imac5k-kmod status"
+    exit 0
+fi
+is_5k() {
+    kscreen-doctor --json 2>/dev/null | python3 -c '
+import json, sys
+try: cfg = json.load(sys.stdin)
+except Exception: sys.exit(1)
+for o in cfg.get("outputs", []):
+    if o.get("name") == "eDP-1" and o.get("enabled"):
+        cur = str(o.get("currentModeId"))
+        for m in o.get("modes", []):
+            if str(m.get("id")) == cur and (m["size"]["width"], m["size"]["height"]) == (5120, 2880):
+                sys.exit(0)
+sys.exit(1)'
+}
+for ((i = 0; i < 36; i++)); do
+    if is_5k; then : > "${XDG_RUNTIME_DIR:?}/imac5k-session-ok"; exit 0; fi
+    sleep 5
+done
+notify-send --app-name="iMac 5K display" --icon=video-display --urgency=critical \
+    "5K driver loaded, but the panel is not at 5120x2880" "Check System Settings > Display. Kernel: $kver. Diagnostics: sudo ~/imac-5k/tools/validate5k.py"
+exit 0

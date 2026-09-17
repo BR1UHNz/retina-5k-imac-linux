@@ -1,0 +1,443 @@
+From 3790194a64a652f198021aff12b1b06503a9c761 Mon Sep 17 00:00:00 2001
+From: br1uhnz <br1uhnz@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 22:01:06 -0500
+Subject: [PATCH] drm/amd/display: never leave a stitched panel without modes
+
+The stitch layer decided "this root is stitched" from the root's own EDID
+quirk alone and then rejected every mode that was not the synthesized
+5120x2880 one. Whenever the root had no tile geometry yet (its boot EDID is
+the single-link APP AE01 identity, without a DisplayID tile block, until the
+second tile is up and the root EDID has been re-read) or the second tile was
+missing, eDP-1 ended up with zero modes: drm_helper_probe adds fallbacks
+only for DisplayPort, KWin treats a connector without driver modes as
+disconnected, and the machine boots to a black internal panel with no
+console. Reviewed as P0-1.
+
+- amdgpu_dm_tiled_stitch_active(): the stitched presentation is exposed only
+  when the root has its 2x1 geometry, the paired slave link points back at
+  it and has a sink carrying the slave-tile quirk, and both connectors share
+  the tile group. Otherwise the root exposes its ordinary EDID modes
+  (3840x2160 in compat mode, or the bare 2560x2880 tile mode). Hysteresis:
+  once active, it stays exposed while the cached root EDID keeps its tile
+  block, so a transient slave drop does not flap the mode list or the
+  compositor's output identity (which is keyed on the EDID).
+- The root EDID re-read after the slave comes up (the only path that gives
+  the root its AE02/tile identity; DC never re-reads an eDP EDID by itself)
+  now retries for up to ~1 s and logs the product id per attempt, and is
+  also run when the slave (re)gains its sink through HPD.
+- A slave hotplug can never produce a root modeset by itself (the slave is
+  non-desktop, so the compositor ignores it): when the slave regains its
+  sink while the root is lit without a peer stream (or with a peer stream on
+  a stale sink), force a root commit so the right tile re-attaches; rate
+  limited to one per 10 s because a link recovery's latch writes pulse HPD.
+- The EDID-update wrapper keeps the root's tile state across a NULL EDID
+  (drm_reset_display_info() would otherwise drop has_tile and the tile
+  group) and makes the slave's non_desktop flag sticky across re-detects.
+- DRM leasing: a slave tile connector is refused a CRTC of its own while the
+  root's peer stream drives that link.
+- Per-TEST_ONLY log chatter (mode_valid/atomic rejects, stream timing dumps,
+  plane split) moved from drm_info to drm_dbg_kms; KWin issues many
+  TEST_ONLY commits per hotplug.
+
+Hardware verification: on a boot where the second tile never answers, the
+panel must still show a desktop (4K single-link); on a normal boot
+"re-read as product 0xae02 with tile block" appears once and eDP-1 offers
+exactly one mode.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 227 +++++++++++++++---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |  10 +
+ 2 files changed, 208 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 4a8f1f3..e91706a 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -267,6 +267,65 @@ static bool amdgpu_dm_connector_tiled_stitch_geometry(const struct drm_connector
+ 	return true;
+ }
+ 
++/*
++ * Whether the stitched (single full-width) presentation can really be driven
++ * right now: the root carries its 2x1 tile geometry, its paired slave link
++ * points back at it and has a sink carrying the slave-tile quirk, and both
++ * connectors are in the same DRM tile group. Only then does the root expose
++ * the stitched mode and reject everything else; otherwise it exposes its
++ * ordinary EDID modes (the single-link 3840x2160 identity, or the bare tile
++ * mode) instead of no mode at all, which made the compositor treat the
++ * internal panel as disconnected. Once it has been true for a root it stays
++ * true while the cached root EDID keeps its tile block, so a transient slave
++ * drop does not flap the mode list and the compositor's output identity.
++ */
++static bool amdgpu_dm_tiled_stitch_active(struct amdgpu_dm_connector *aconnector)
++{
++	struct drm_connector *connector = &aconnector->base;
++	const struct dc_link *root = aconnector->dc_link;
++	const struct dc_link *slave;
++	const struct amdgpu_dm_connector *sconn;
++	int tile_w, tile_h;
++	bool ok;
++
++	if (!amdgpu_dm_link_is_tiled_stitch_root(root))
++		return false;
++	if (!amdgpu_dm_connector_tiled_stitch_geometry(connector, &tile_w, &tile_h))
++		return false;
++
++	slave = root->tiled_peer;
++	ok = slave && slave->tiled_role == DC_TILED_ROLE_SLAVE &&
++	     slave->tiled_peer == root && slave->local_sink &&
++	     slave->local_sink->edid_caps.panel_patch.apple_tiled_slave;
++	if (ok) {
++		sconn = slave->priv;
++		if (sconn && connector->tile_group && sconn->base.tile_group &&
++		    connector->tile_group != sconn->base.tile_group)
++			ok = false;
++	}
++	if (ok) {
++		aconnector->tiled_stitch_latched = true;
++		return true;
++	}
++	return aconnector->tiled_stitch_latched && connector->has_tile;
++}
++
++/*
++ * A slave tile connector must never get a CRTC of its own while the root's
++ * peer stream drives that link (a DRM lease client is offered the
++ * non-desktop slave and could otherwise modeset it under the peer stream).
++ */
++static bool amdgpu_dm_tiled_stitch_slave_reserved(const struct amdgpu_dm_connector *aconnector)
++{
++	struct amdgpu_dm_connector *root;
++
++	if (!amdgpu_dm_link_is_tiled_stitch_slave(aconnector->dc_link) ||
++	    !aconnector->dc_link->tiled_peer)
++		return false;
++	root = aconnector->dc_link->tiled_peer->priv;
++	return root && amdgpu_dm_tiled_stitch_active(root);
++}
++
+ static bool amdgpu_dm_tiled_stitch_mode_is_stitched(
+ 		const struct drm_connector *connector,
+ 		const struct drm_display_mode *mode)
+@@ -493,13 +552,28 @@ static int amdgpu_dm_tiled_stitch_edid_connector_update(
+ 	bool stitch_root;
+ 	int ret;
+ 
+-	stitch_root = drm_edid &&
+-		      amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link);
++	/*
++	 * Also for a NULL EDID (a failed re-read): drm_reset_display_info()
++	 * would otherwise clear has_tile and the tile group, and with it the
++	 * stitched identity that the compositor keys its output config on.
++	 */
++	stitch_root = amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link);
+ 	if (stitch_root)
+ 		amdgpu_dm_tiled_stitch_save_tile_state(connector, &tile);
+ 
+ 	ret = drm_edid_connector_update(connector, drm_edid);
+ 
++	if (amdgpu_dm_link_is_tiled_stitch_slave(aconnector->dc_link)) {
++		/*
++		 * drm_reset_display_info() cleared non_desktop; get_modes()
++		 * re-asserts it, but nothing may see the slave as a desktop
++		 * output in between.
++		 */
++		connector->display_info.non_desktop = true;
++		drm_object_property_set_value(&connector->base,
++			connector->dev->mode_config.non_desktop_property, 1);
++	}
++
+ 	if (!stitch_root)
+ 		return ret;
+ 
+@@ -936,6 +1010,7 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
+ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector);
+ static void handle_hpd_rx_irq(void *param);
+ static void amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev);
++static int dm_force_atomic_commit(struct drm_connector *connector);
+ 
+ static void amdgpu_dm_backlight_set_level(struct amdgpu_display_manager *dm,
+ 					 int bl_idx,
+@@ -5248,6 +5323,61 @@ static void hdmi_hpd_debounce_work(struct work_struct *work)
+ 	}
+ }
+ 
++/*
++ * The second tile of a stitched Apple 5K panel just (re)gained its sink
++ * through HPD. Its connector is non-desktop, so the compositor never reacts
++ * to that plug: nothing would re-read the root's EDID or re-attach the right
++ * tile to an already lit root. Do both here. Rate limited: a link recovery's
++ * own latch writes pulse this HPD too.
++ */
++static void amdgpu_dm_tiled_slave_sink_gained(struct amdgpu_device *adev,
++					      struct amdgpu_dm_connector *aconnector)
++{
++	struct drm_device *dev = adev_to_drm(adev);
++	struct dc_link *link = aconnector->dc_link;
++	struct amdgpu_dm_connector *root;
++	struct drm_crtc *crtc;
++	bool reattach = false;
++	int ret;
++
++	if (!amdgpu_dm_link_is_tiled_stitch_slave(link) || !link->local_sink ||
++	    !link->tiled_peer)
++		return;
++	root = link->tiled_peer->priv;
++	if (!root)
++		return;
++
++	amdgpu_dm_reprobe_tiled_root_after_slave(adev);
++
++	drm_modeset_lock_all(dev);
++	crtc = root->base.state ? root->base.state->crtc : NULL;
++	if (crtc && crtc->state && crtc->state->active &&
++	    root->base.encoder && root->base.encoder->crtc == crtc) {
++		const struct dm_crtc_state *cs = to_dm_crtc_state(crtc->state);
++
++		reattach = !cs->stream_peer ||
++			   cs->stream_peer->sink != link->local_sink;
++	}
++	if (reattach) {
++		if (time_before(jiffies, adev->dm.tiled_reattach_jiffies +
++					 msecs_to_jiffies(APPLE5K_REATTACH_MIN_MS)) &&
++		    adev->dm.tiled_reattach_jiffies) {
++			drm_dbg_kms(dev, "TILED_STITCH: right tile re-attach rate limited\n");
++		} else {
++			adev->dm.tiled_reattach_jiffies = jiffies;
++			drm_info(dev,
++				 "TILED_STITCH: second tile %s regained its sink; re-attaching it to %s\n",
++				 aconnector->base.name, root->base.name);
++			ret = dm_force_atomic_commit(&root->base);
++			if (ret)
++				drm_warn(dev,
++					 "TILED_STITCH: re-attach commit on %s failed: %d\n",
++					 root->base.name, ret);
++		}
++	}
++	drm_modeset_unlock_all(dev);
++}
++
+ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
+ {
+ 	struct drm_connector *connector = &aconnector->base;
+@@ -5338,6 +5468,8 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
+ 			dm_restore_drm_connector_state(dev, connector);
+ 			drm_modeset_unlock_all(dev);
+ 
++			amdgpu_dm_tiled_slave_sink_gained(adev, aconnector);
++
+ 			if (aconnector->base.force == DRM_FORCE_UNSPECIFIED)
+ 				drm_kms_helper_connector_hotplug_event(connector);
+ 		}
+@@ -8626,7 +8758,7 @@ create_stream_for_sink(struct drm_connector *connector,
+ 	 * width). The peer stream clones this timing.
+ 	 */
+ 	if (amdgpu_dm_tiled_stitch_apply_tile_timing(stream, connector))
+-		drm_info(dev,
++		drm_dbg_kms(dev,
+ 			 "TILED_STITCH: forced root stream to %ux%u tile timing (crtc mode is %dx%d; src/dst=%dx%d)\n",
+ 			 stream->timing.h_addressable, stream->timing.v_addressable,
+ 			 mode.hdisplay, mode.vdisplay,
+@@ -9421,7 +9553,7 @@ static int amdgpu_dm_replace_tiled_stitch_modes(struct drm_connector *connector)
+ 	struct drm_display_mode *stitched;
+ 	int tile_w, tile_h;
+ 
+-	if (!amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link))
++	if (!amdgpu_dm_tiled_stitch_active(aconnector))
+ 		return 0;
+ 	if (!amdgpu_dm_connector_tiled_stitch_geometry(connector, &tile_w, &tile_h))
+ 		return 0;
+@@ -9500,6 +9632,8 @@ static void amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev)
+ 	struct drm_connector_list_iter iter;
+ 	struct drm_connector *connector;
+ 	struct dc_sink *sink;
++	unsigned int product = 0;
++	int attempt;
+ 
+ 	drm_connector_list_iter_begin(dev, &iter);
+ 	drm_for_each_connector_iter(connector, &iter) {
+@@ -9520,22 +9654,49 @@ static void amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev)
+ 	if (!sink)
+ 		return;
+ 
+-	mutex_lock(&adev->dm.dc_lock);
+-	dc_exit_ips_for_hw_access(adev->dm.dc);
+-	dm_helpers_read_local_edid(root->dc_link->ctx, root->dc_link, sink);
+-	mutex_unlock(&adev->dm.dc_lock);
++	/*
++	 * The panel's TCON switches the root EDID from the single-link identity
++	 * (APP AE01, no tile block) to the dual-tile one (AE02) once the second
++	 * tile is up. On this panel the flip follows HPD1 within milliseconds, but the
++	 * whole stitched identity hangs on this one re-read (DC never re-reads
++	 * an eDP EDID on its own), so retry for up to ~1 s.
++	 */
++	for (attempt = 0; attempt < 10; attempt++) {
++		if (attempt)
++			msleep(100);
+ 
+-	if (!sink->dc_edid.length)
+-		return;
+-	/* Keep the connector's cached EDID (what get_modes consumes) in step. */
+-	drm_edid_free(root->drm_edid);
+-	root->drm_edid = drm_edid_alloc((const struct edid *)sink->dc_edid.raw_edid,
+-					sink->dc_edid.length);
+-	mutex_lock(&dev->mode_config.mutex);
+-	amdgpu_dm_tiled_stitch_edid_connector_update(root, root->drm_edid);
+-	/* The re-read root now carries the tile block; hide it again. */
+-	amdgpu_dm_tiled_stitch_hide_tile_property(root);
+-	mutex_unlock(&dev->mode_config.mutex);
++		mutex_lock(&adev->dm.dc_lock);
++		dc_exit_ips_for_hw_access(adev->dm.dc);
++		dm_helpers_read_local_edid(root->dc_link->ctx, root->dc_link, sink);
++		mutex_unlock(&adev->dm.dc_lock);
++
++		if (sink->dc_edid.length < EDID_LENGTH)
++			continue;
++		product = sink->dc_edid.raw_edid[10] |
++			  (sink->dc_edid.raw_edid[11] << 8);
++		/* Keep the connector's cached EDID (what get_modes consumes) in step. */
++		drm_edid_free(root->drm_edid);
++		root->drm_edid = drm_edid_alloc((const struct edid *)sink->dc_edid.raw_edid,
++						sink->dc_edid.length);
++		mutex_lock(&dev->mode_config.mutex);
++		amdgpu_dm_tiled_stitch_edid_connector_update(root, root->drm_edid);
++		/* The re-read root now carries the tile block; hide it again. */
++		amdgpu_dm_tiled_stitch_hide_tile_property(root);
++		mutex_unlock(&dev->mode_config.mutex);
++
++		if (root->base.has_tile) {
++			drm_info(dev,
++				 "TILED_STITCH: root %s re-read as product 0x%04x with tile block (attempt %d)\n",
++				 root->base.name, product, attempt + 1);
++			return;
++		}
++		drm_dbg_kms(dev,
++			    "TILED_STITCH: root %s still product 0x%04x without tile block (attempt %d)\n",
++			    root->base.name, product, attempt + 1);
++	}
++	drm_warn(dev,
++		 "TILED_STITCH: root %s never exposed its tile block; staying on its single-link modes\n",
++		 root->base.name);
+ }
+ 
+ struct dc_stream_state *
+@@ -9664,11 +9825,11 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
+ 	    !amdgpu_dm_mode_is_tile_size(connector, mode))
+ 		return MODE_PANEL;
+ 
+-	if (amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link) &&
++	if (amdgpu_dm_tiled_stitch_active(aconnector) &&
+ 	    !amdgpu_dm_tiled_stitch_mode_is_stitched(connector, mode)) {
+ 		amdgpu_dm_connector_tiled_stitch_geometry(connector,
+ 							  &tile_w, &tile_h);
+-		drm_info(connector->dev,
++		drm_dbg_kms(connector->dev,
+ 			 "APPLE5K: mode_valid stitch root reject connector=%s link[%u] mode=\"%s\" %dx%d clock=%d stitch_size=%ux%u result=%d\n",
+ 			 connector->name,
+ 			 aconnector->dc_link ? aconnector->dc_link->link_index : 0xffffffff,
+@@ -13501,7 +13662,7 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
+ 		if (amdgpu_dm_tiled_stitch_has_live_root_stream(aconnector,
+ 								dm_old_crtc_state,
+ 								new_crtc_state)) {
+-			drm_info(adev_to_drm(adev),
++			drm_dbg_kms(adev_to_drm(adev),
+ 				 "TILED_STITCH: accept logical root modeset without reprogramming connector=%s crtc=%d old=\"%s\" %dx%d clock=%d new=\"%s\" %dx%d clock=%d\n",
+ 				 connector->name, crtc->base.id,
+ 				 old_crtc_state->mode.name,
+@@ -13520,12 +13681,20 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
+ 		if (!drm_atomic_crtc_needs_modeset(new_crtc_state))
+ 			goto skip_modeset;
+ 
+-		if (amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link) &&
++		if (amdgpu_dm_tiled_stitch_slave_reserved(aconnector)) {
++			drm_dbg_kms(adev_to_drm(adev),
++				    "TILED_STITCH: reject crtc %d on slave tile connector %s: driven by the root's peer stream\n",
++				    crtc->base.id, connector->name);
++			ret = -EINVAL;
++			goto fail;
++		}
++
++		if (amdgpu_dm_tiled_stitch_active(aconnector) &&
+ 		    !amdgpu_dm_tiled_stitch_mode_is_stitched(connector,
+ 							     &new_crtc_state->mode)) {
+ 			amdgpu_dm_connector_tiled_stitch_geometry(connector,
+ 								  &tile_w, &tile_h);
+-			drm_info(adev_to_drm(adev),
++			drm_dbg_kms(adev_to_drm(adev),
+ 				 "TILED_STITCH: atomic reject non-stitched root mode connector=%s crtc=%d mode=\"%s\" %dx%d clock=%d stitch_size=%ux%u\n",
+ 				 connector->name, crtc->base.id,
+ 				 new_crtc_state->mode.name,
+@@ -13573,7 +13742,7 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
+ 		if (amdgpu_dm_tiled_stitch_has_live_root_stream(aconnector,
+ 								dm_old_crtc_state,
+ 								new_crtc_state)) {
+-			drm_info(adev_to_drm(adev),
++			drm_dbg_kms(adev_to_drm(adev),
+ 				 "TILED_STITCH: keep live root stream for logical modeset connector=%s crtc=%d mode=\"%s\" %dx%d clock=%d\n",
+ 				 connector ? connector->name : "unknown",
+ 				 crtc->base.id,
+@@ -13736,7 +13905,7 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
+ 				struct dc_link *peer = new_stream->link->tiled_peer;
+ 				struct dc_crtc_timing *t = &new_stream->timing;
+ 
+-				drm_info(adev_to_drm(adev),
++				drm_dbg_kms(adev_to_drm(adev),
+ 					 "TILED_STITCH: crtc=%d root link[%u] stream timing %ux%u total %ux%u pixclk_100hz=%u front_porch h=%u v=%u sync h=%u v=%u; ctx stream_count=%u\n",
+ 					 crtc->base.id, new_stream->link->link_index,
+ 					 t->h_addressable, t->v_addressable,
+@@ -13745,12 +13914,12 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
+ 					 t->h_sync_width, t->v_sync_width,
+ 					 dm_state->context->stream_count);
+ 				if (peer)
+-					drm_info(adev_to_drm(adev),
++					drm_dbg_kms(adev_to_drm(adev),
+ 						 "TILED_STITCH: peer link[%u] signal=%d has_sink=%d\n",
+ 						 peer->link_index, peer->connector_signal,
+ 						 !!peer->local_sink);
+ 				else
+-					drm_info(adev_to_drm(adev),
++					drm_dbg_kms(adev_to_drm(adev),
+ 						 "TILED_STITCH: no tiled_peer on root link[%u]\n",
+ 						 new_stream->link->link_index);
+ 			}
+@@ -14381,7 +14550,7 @@ static int dm_update_plane_state(struct dc *dc,
+ 
+ 			dm_new_plane_state->dc_state_peer = peer_plane;
+ 
+-			drm_info(new_plane_crtc->dev,
++			drm_dbg_kms(new_plane_crtc->dev,
+ 				 "TILED_STITCH: plane split (modeset) root src(%d,%d %dx%d) dst(%d,%d %dx%d) clip(%dx%d); peer src.x=%d; root_stream=%p peer_stream=%p\n",
+ 				 dc_new_plane_state->src_rect.x, dc_new_plane_state->src_rect.y,
+ 				 dc_new_plane_state->src_rect.width, dc_new_plane_state->src_rect.height,
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index 65b8704..b97aebd 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -658,6 +658,9 @@ struct amdgpu_display_manager {
+ 	 * must not touch the timing generators until it is over.
+ 	 */
+ 	bool tiled_commit_in_progress;
++	/* Last forced root re-commit after the second tile regained its sink. */
++	unsigned long tiled_reattach_jiffies;
++#define APPLE5K_REATTACH_MIN_MS 10000
+ /* DCE < 12: re-run the one-shot OTG alignment only beyond this phase error. */
+ #define APPLE5K_REALIGN_TOLERANCE_LINES 3
+ 	bool disable_hpd_irq;
+@@ -892,6 +895,13 @@ struct amdgpu_dm_connector {
+ 
+ 	/* Automated testing */
+ 	bool timing_changed;
++	/*
++	 * Apple 5K stitch root: the stitched presentation was active at least
++	 * once, so a transient loss of the second tile keeps the mode list (and
++	 * the compositor's output identity) stable while the cached root EDID
++	 * still carries the tile block.
++	 */
++	bool tiled_stitch_latched;
+ 	struct dc_crtc_timing *timing_requested;
+ 
+ 	/* Adaptive Sync */
+-- 
+2.55.0
+

@@ -1,0 +1,348 @@
+From 3eb405d29bd220a04dcf52cb335c0785de5981b6 Mon Sep 17 00:00:00 2001
+From: br1uhnz <br1uhnz@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 22:01:06 -0500
+Subject: [PATCH] drm/amd/display: fix the DCE 10/11 tile genlock path
+
+Three fixes for the timing synchronization of the two 2560x2880 tile streams
+of the Apple 5K panel on DCE 10 (Tonga, iMac15,1), all found by reading
+v7.2.5 against register maps and Apple's own AMD9000Controller driver:
+
+1. dce110_timing_generator_setup_global_swap_lock() wrote DCIO_GSL0_CNTL
+   through CRTC_REG(), which adds the TG's CRTC offset (0x200 per instance)
+   to a register that is global (0x4826). For TG1 the write landed on
+   DIG0_AFMT_GENERIC_1 (0x4a26) and for TG2 on DIG2_AFMT_GENERIC_1 (0x4c26),
+   i.e. another output's SDP payload memory, and the GSL vsync source was
+   only programmed when the group happened to include TG0. Apple's driver
+   writes absolute MMIO 0x12098 (= dword 0x4826) with the master CRTC index.
+   Write the register at its absolute address.
+
+2. The lean core flags triggered_crtc_reset.enabled on both tiles, but on
+   DCE < 12 the per-frame reset path never arms anything:
+   enable_timing_multisync() passes a slaves-only list to a loop that starts
+   at index 1, and enable_crtc_reset() writes a raw TG index into the
+   CRTC_TRIGB_SOURCE_SELECT enum field (0 = LOGIC_ZERO). The only effect was
+   a GSL setup/teardown churn on the live tile per dc_trigger_sync() -- the
+   very misaddressed write above. Gate the flag, and the debugfs
+   force_timing_sync knob, on DCE >= 12 (measured on an iMac15,1 after the stock
+   knob: CRTC_TRIGB_CNTL == 0, i.e. nothing armed).
+
+3. On DCE < 12 the post-commit "resync" called dc_trigger_sync(), whose
+   program_timing_sync() drops every unblanked pipe, so it re-aligned
+   nothing on a live pair. Replace it with a measured re-align: read both
+   tile OTG positions (first OTG before and after the second so the read
+   latency cancels), wrap the vertical delta by v_total, and only if it
+   exceeds 3 lines run the one-shot dce110_enable_timing_synchronization()
+   on the pair (same master choice as the modeset: the lower pipe), logging
+   before/after. Both OTGs share one DP clock source (0.0 ppm measured), so
+   once aligned they stay aligned; the one-shot jumps the second OTG once,
+   which is why it must never run unconditionally.
+
+Also: a dm->tiled_commit_in_progress flag, set under dc_lock at the start of
+a commit that modesets a stitched root and cleared before the resync is
+re-armed, makes the worker requeue instead of touching the timing
+generators between the stream and plane phases of that commit (dc_lock is
+dropped in between). And a one-time warning when the two tile streams do not
+have identical timing, which is the signature of the eDP native-timing
+scaling pitfall seen on the test machine.
+
+Hardware verification: after any modeset, both OTGs 2720x2962 and the
+CRTC_STATUS_POSITION delta <= 3 lines; DCIO_GSL0_CNTL (0x4826) reads the
+master TG index during a sync; 0x4a26/0x4c26 unchanged across modesets;
+CRTC_TRIGA/TRIGB/FORCE_COUNT_NOW idle afterwards; "re-aligned" lines in the
+journal only when the tiles had actually drifted.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 168 +++++++++++++++++-
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |   8 +
+ .../dc/dce110/dce110_timing_generator.c       |  11 +-
+ 3 files changed, 177 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 801358c..4a8f1f3 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -39,6 +39,7 @@
+ #include "dc/dc_edid_parser.h"
+ #include "dc/dc_stat.h"
+ #include "dc/dc_state.h"
++#include "dc/inc/resource.h"
+ #include "amdgpu_dm_trace.h"
+ #include "link/protocols/link_dpcd.h"
+ #include "link_service_types.h"
+@@ -8073,6 +8074,28 @@ static void set_master_stream(struct dc_stream_state *stream_set[],
+ 	}
+ }
+ 
++/*
++ * The per-frame CRTC position reset (triggered_crtc_reset) only works on
++ * DCE 12+: on DCE 10/11 enable_timing_multisync() hands
++ * dce110_enable_per_frame_crtc_position_reset() a slaves-only list whose
++ * loop starts at index 1, and enable_crtc_reset() writes a raw TG index into
++ * the CRTC_TRIGB_SOURCE_SELECT enum field (0 = LOGIC_ZERO), so nothing is
++ * ever armed; all that remains is a GSL setup/teardown churn on the live
++ * tile on every dc_trigger_sync(). The effective alignment on those parts is
++ * the one-shot dce110_enable_timing_synchronization() and the measured
++ * re-align in amdgpu_dm_tiled_measured_realign().
++ */
++static bool amdgpu_dm_per_frame_crtc_reset_supported(const struct dc *dc)
++{
++	return dc && dc->ctx && dc->ctx->dce_version >= DCE_VERSION_12_0;
++}
++
++static bool amdgpu_dm_force_timing_sync_enabled(struct amdgpu_display_manager *dm)
++{
++	return dm->force_timing_sync &&
++	       amdgpu_dm_per_frame_crtc_reset_supported(dm->dc);
++}
++
+ static void dm_enable_per_frame_crtc_master_sync(struct dc_state *context)
+ {
+ 	int i = 0;
+@@ -8098,7 +8121,8 @@ static void dm_enable_per_frame_crtc_master_sync(struct dc_state *context)
+ 	 */
+ 	for (i = 0; i < context->stream_count; i++) {
+ 		stream = context->streams[i];
+-		if (stream && stream->link && stream->link->tiled_peer)
++		if (stream && stream->link && stream->link->tiled_peer &&
++		    amdgpu_dm_per_frame_crtc_reset_supported(stream->ctx->dc))
+ 			stream->triggered_crtc_reset.enabled = true;
+ 	}
+ 
+@@ -12808,6 +12832,18 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_commit *state)
+ 
+ 	trace_amdgpu_dm_atomic_commit_tail_begin(state);
+ 
++	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
++		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
++		if (drm_atomic_crtc_needs_modeset(new_crtc_state) &&
++		    dm_new_crtc_state->stream &&
++		    amdgpu_dm_link_is_tiled_stitch_root(dm_new_crtc_state->stream->link)) {
++			mutex_lock(&dm->dc_lock);
++			dm->tiled_commit_in_progress = true;
++			mutex_unlock(&dm->dc_lock);
++			break;
++		}
++	}
++
+ 	drm_atomic_helper_update_legacy_modeset_state(dev, state);
+ 	drm_dp_mst_atomic_wait_for_dependencies(state);
+ 
+@@ -13069,6 +13105,9 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_commit *state)
+ 	drm_atomic_helper_cleanup_planes(dev, state);
+ 
+ 	/* Arm after the complete commit, not midway through stream programming. */
++	mutex_lock(&dm->dc_lock);
++	dm->tiled_commit_in_progress = false;
++	mutex_unlock(&dm->dc_lock);
+ 	if (dc_state) {
+ 		for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
+ 			dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
+@@ -13522,7 +13561,7 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
+ 		 * be enabled or not.
+ 		 */
+ 		new_stream->triggered_crtc_reset.enabled =
+-			dm->force_timing_sync;
++			amdgpu_dm_force_timing_sync_enabled(dm);
+ 
+ 		dm_new_crtc_state->abm_level = dm_new_conn_state->abm_level;
+ 
+@@ -15729,6 +15768,103 @@ static bool amdgpu_dm_tiled_check_links(struct amdgpu_device *adev)
+ 	return true;
+ }
+ 
++/*
++ * Vertical phase of the second tile OTG relative to the first, in lines,
++ * wrapped to (-v_total/2, v_total/2]. The first OTG is read before and after
++ * the second so the read latency cancels out.
++ */
++static int amdgpu_dm_tiled_phase_delta(struct pipe_ctx *pair[2], int v_total)
++{
++	struct timing_generator *tga = pair[0]->stream_res.tg;
++	struct timing_generator *tgb = pair[1]->stream_res.tg;
++	struct crtc_position a = {0}, b = {0}, a2 = {0};
++	int delta;
++
++	tga->funcs->get_position(tga, &a);
++	tgb->funcs->get_position(tgb, &b);
++	tga->funcs->get_position(tga, &a2);
++
++	delta = ((int)b.vertical_count * 2 - (int)a.vertical_count -
++		 (int)a2.vertical_count) / 2;
++	delta = ((delta + v_total / 2) % v_total + v_total) % v_total - v_total / 2;
++	return delta;
++}
++
++/*
++ * DCE < 12: the only alignment the tiles ever get is the one-shot
++ * dce110_enable_timing_synchronization() run inside a modeset commit, and
++ * program_timing_sync() drops every unblanked pipe from the group, so
++ * dc_trigger_sync() on a live pair aligns nothing. Both tiles run from one
++ * DP clock source (measured 0.0 ppm), so once aligned they stay aligned; a
++ * link recovery or a modeset that raced the one-shot can still leave them
++ * offset. Measure the two tile OTGs and re-run the one-shot only when the
++ * offset exceeds the tolerance -- it jumps the second OTG once, which is
++ * visible, so it must never run unconditionally. Caller holds dc_lock.
++ */
++static void amdgpu_dm_tiled_measured_realign(struct amdgpu_device *adev)
++{
++	struct dc *dc = adev->dm.dc;
++	struct dc_state *context = dc->current_state;
++	struct pipe_ctx *pair[2] = { NULL, NULL };
++	int i, n = 0, v_total, delta, delta_after;
++
++	if (!context || !dc->hwss.enable_timing_synchronization)
++		return;
++
++	for (i = 0; i < dc->res_pool->pipe_count && n < 2; i++) {
++		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++
++		if (!resource_is_pipe_type(pipe, OPP_HEAD) || !pipe->stream ||
++		    pipe->stream->dpms_off || !pipe->stream_res.tg ||
++		    !pipe->stream_res.tg->funcs->get_position ||
++		    !pipe->stream->link || !pipe->stream->link->tiled_peer)
++			continue;
++		if (!amdgpu_dm_link_is_tiled_stitch_root(pipe->stream->link) &&
++		    !amdgpu_dm_link_is_tiled_stitch_slave(pipe->stream->link))
++			continue;
++		pair[n++] = pipe;
++	}
++	if (n != 2 || pair[0]->stream->link->tiled_peer != pair[1]->stream->link)
++		return;
++
++	if (!resource_are_streams_timing_synchronizable(pair[0]->stream,
++							pair[1]->stream)) {
++		/* The old eDP native-timing/scaling pitfall looks exactly like this. */
++		drm_warn_once(adev_to_drm(adev),
++			      "APPLE5K: tile pair timings differ: OTG%u %ux%u/%u vs OTG%u %ux%u/%u (100Hz)\n",
++			      pair[0]->stream_res.tg->inst,
++			      pair[0]->stream->timing.h_total,
++			      pair[0]->stream->timing.v_total,
++			      pair[0]->stream->timing.pix_clk_100hz,
++			      pair[1]->stream_res.tg->inst,
++			      pair[1]->stream->timing.h_total,
++			      pair[1]->stream->timing.v_total,
++			      pair[1]->stream->timing.pix_clk_100hz);
++		return;
++	}
++
++	v_total = pair[0]->stream->timing.v_total;
++	if (v_total < 2)
++		return;
++
++	delta = amdgpu_dm_tiled_phase_delta(pair, v_total);
++	if (abs(delta) <= APPLE5K_REALIGN_TOLERANCE_LINES) {
++		drm_dbg_kms(adev_to_drm(adev),
++			    "APPLE5K: tiles aligned: OTG%u-OTG%u = %d lines\n",
++			    pair[1]->stream_res.tg->inst,
++			    pair[0]->stream_res.tg->inst, delta);
++		return;
++	}
++
++	/* Same master choice as the modeset-time one-shot: the lower pipe. */
++	dc->hwss.enable_timing_synchronization(dc, context, 0, 2, pair);
++	delta_after = amdgpu_dm_tiled_phase_delta(pair, v_total);
++	drm_info(adev_to_drm(adev),
++		 "APPLE5K: re-aligned OTG%u to OTG%u: %d -> %d lines\n",
++		 pair[1]->stream_res.tg->inst, pair[0]->stream_res.tg->inst,
++		 delta, delta_after);
++}
++
+ static void amdgpu_dm_tiled_resync_work(struct work_struct *work)
+ {
+ 	struct amdgpu_display_manager *dm =
+@@ -15750,6 +15886,13 @@ static void amdgpu_dm_tiled_resync_work(struct work_struct *work)
+ 		goto out;
+ 	}
+ 
++	if (dm->tiled_commit_in_progress) {
++		/* A stitched modeset is between its phases; look again later. */
++		mod_delayed_work(system_wq, &dm->tiled_resync_work,
++				 msecs_to_jiffies(APPLE5K_LINK_SETTLE_MS));
++		goto out;
++	}
++
+ 	if (dm->tiled_link_checks) {
+ 		drm_info(adev_to_drm(adev),
+ 			 "APPLE5K: link-health pass %u/%u recoveries=%u\n",
+@@ -15764,11 +15907,15 @@ static void amdgpu_dm_tiled_resync_work(struct work_struct *work)
+ 	}
+ 
+ 	if (dc->current_state && dm->tiled_sync_pending) {
+-		for (i = 0; i < dc->current_state->stream_count; i++)
+-			dc->current_state->streams[i]->triggered_crtc_reset.enabled =
+-				dm->force_timing_sync;
+-		dm_enable_per_frame_crtc_master_sync(dc->current_state);
+-		dc_trigger_sync(dc, dc->current_state);
++		if (!amdgpu_dm_per_frame_crtc_reset_supported(dc)) {
++			amdgpu_dm_tiled_measured_realign(adev);
++		} else {
++			for (i = 0; i < dc->current_state->stream_count; i++)
++				dc->current_state->streams[i]->triggered_crtc_reset.enabled =
++					amdgpu_dm_force_timing_sync_enabled(dm);
++			dm_enable_per_frame_crtc_master_sync(dc->current_state);
++			dc_trigger_sync(dc, dc->current_state);
++		}
+ 	}
+ 	dm->tiled_sync_pending = false;
+ 	/* Read again after recovery AND timing sync. Neither an immediate lock
+@@ -15830,10 +15977,13 @@ void amdgpu_dm_trigger_timing_sync(struct drm_device *dev)
+ 		for (i = 0; i < dc->current_state->stream_count; ++i)
+ 			dc->current_state->streams[i]
+ 				->triggered_crtc_reset.enabled =
+-				adev->dm.force_timing_sync;
++				amdgpu_dm_force_timing_sync_enabled(&adev->dm);
+ 
+ 		dm_enable_per_frame_crtc_master_sync(dc->current_state);
+-		dc_trigger_sync(dc, dc->current_state);
++		if (amdgpu_dm_per_frame_crtc_reset_supported(dc))
++			dc_trigger_sync(dc, dc->current_state);
++		else
++			amdgpu_dm_tiled_measured_realign(adev);
+ 	}
+ 	mutex_unlock(&adev->dm.dc_lock);
+ }
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index a79eaff..65b8704 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -652,6 +652,14 @@ struct amdgpu_display_manager {
+ 	bool tiled_resync_stopping;
+ 	/* A tiled modeset ran while in_suspend was set; dm_complete() arms it. */
+ 	bool tiled_resume_modeset;
++	/*
++	 * A commit that modesets a stitched root is between its phases (dc_lock
++	 * is dropped between stream and plane programming); the resync worker
++	 * must not touch the timing generators until it is over.
++	 */
++	bool tiled_commit_in_progress;
++/* DCE < 12: re-run the one-shot OTG alignment only beyond this phase error. */
++#define APPLE5K_REALIGN_TOLERANCE_LINES 3
+ 	bool disable_hpd_irq;
+ 	bool dmcub_trace_event_en;
+ 	/**
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
+index b015b27..bd08b70 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
+@@ -1268,7 +1268,16 @@ void dce110_timing_generator_setup_global_swap_lock(
+ 			    DCIO_GSL0_CNTL,
+ 			    DCIO_GSL0_GLOBAL_UNLOCK_SEL);
+ 
+-	dm_write_reg(tg->ctx, CRTC_REG(mmDCIO_GSL0_CNTL), value);
++	/*
++	 * DCIO_GSL0_CNTL is one global DCIO register (0x4826 on DCE 10/11.x),
++	 * not a per-CRTC one: CRTC_REG() adds this TG's CRTC offset (0x200 per
++	 * instance), so for TG1 the write landed on mmDIG0_AFMT_GENERIC_1 and
++	 * for TG2 on mmDIG2_AFMT_GENERIC_1 -- another output's SDP payload
++	 * memory -- and the GSL vsync source was only ever programmed when the
++	 * group happened to include TG0. Apple's Tonga driver writes this
++	 * register at its absolute address.
++	 */
++	dm_write_reg(tg->ctx, mmDCIO_GSL0_CNTL, value);
+ 
+ 
+ 	{
+-- 
+2.55.0
+
