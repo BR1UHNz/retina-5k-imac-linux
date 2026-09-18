@@ -94,7 +94,8 @@ sudo ./tools/validate5k.py          # full hardware pass criteria
 sudo ./deploy.sh --remove           # back to the stock driver everywhere
 ```
 
-**If a patched kernel ever black-screens:** power-cycle twice and it reverts itself;
+**If a patched kernel ever black-screens:** power-cycle twice and it reverts itself
+(a stack that has already worked once is never reverted automatically);
 or pick the previous kernel in GRUB; or add
 `modprobe.blacklist=amdgpu rd.driver.blacklist=amdgpu` to the boot entry and run
 `sudo imac5k-kmod revert $(uname -r)`.

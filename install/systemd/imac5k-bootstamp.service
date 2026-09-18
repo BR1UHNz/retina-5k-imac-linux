@@ -1,0 +1,16 @@
+[Unit]
+Description=Native 5K: record that this boot shut down cleanly
+Documentation=man:imac5k-kmod(8)
+After=imac5k-catchup.service
+
+# Nothing to do at boot. The point is ExecStop, which runs on a clean shutdown and clears the boot
+# stamp that imac5k-catchup.service wrote. A boot that hangs or is power-cycled never reaches it, so
+# the stamp survives and the next boot counts that boot as one that failed to bring the panel up.
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/sbin/imac5k-kmod boot-clean
+
+[Install]
+WantedBy=multi-user.target

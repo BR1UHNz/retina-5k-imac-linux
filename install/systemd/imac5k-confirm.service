@@ -1,0 +1,8 @@
+[Unit]
+Description=Native 5K: confirm the stitched panel came up on this boot
+Documentation=man:imac5k-kmod(8)
+ConditionPathExists=/sys/module/amdgpu/parameters/tiled_stitch
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/imac5k-kmod confirm

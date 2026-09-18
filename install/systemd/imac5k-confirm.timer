@@ -1,0 +1,12 @@
+[Unit]
+Description=Native 5K: confirm the stitched panel came up on this boot
+
+# Boot accounting runs from here, not from imac5k-catchup.service, so that it happens late enough for
+# the display to have come up. A restart before this fires is simply not counted as a failed boot.
+[Timer]
+OnBootSec=90s
+AccuracySec=5s
+Unit=imac5k-confirm.service
+
+[Install]
+WantedBy=timers.target

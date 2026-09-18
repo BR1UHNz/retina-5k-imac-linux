@@ -7,7 +7,7 @@ cd "$(dirname "$(readlink -f "$0")")"
 [[ $EUID == 0 ]] || { echo "run with sudo" >&2; exit 1; }
 
 if [[ ${1:-} == --remove ]]; then
-    systemctl disable --now imac5k-catchup.service imac5k-mark-ok.path 2>/dev/null || true
+    systemctl disable --now imac5k-catchup.service imac5k-mark-ok.path imac5k-confirm.timer imac5k-bootstamp.service 2>/dev/null || true
     systemctl --global disable imac5k-session-check.service 2>/dev/null || true
     for k in /usr/lib/modules/*/; do
         k=$(basename "$k"); [[ -d /usr/lib/modules/$k/updates/imac5k ]] || continue
@@ -17,6 +17,7 @@ if [[ ${1:-} == --remove ]]; then
     rm -f /etc/kernel/install.d/45-imac5k.install /etc/kernel/install.d/96-imac5k-queue.install /etc/kernel/install.d/96-imac5k.install \
           /etc/systemd/system/imac5k-build@.service /etc/systemd/system/imac5k-catchup.service /etc/systemd/system/imac5k-ensure.service \
           /etc/systemd/system/imac5k-mark-ok.path /etc/systemd/system/imac5k-mark-ok.service /etc/systemd/user/imac5k-session-check.service \
+          /etc/systemd/system/imac5k-confirm.service /etc/systemd/system/imac5k-confirm.timer /etc/systemd/system/imac5k-bootstamp.service \
           /usr/local/sbin/imac5k-kmod /usr/local/sbin/imac5k-build-module /usr/local/sbin/imac5k-session-check /usr/local/sbin/imac5k-build /usr/local/sbin/imac5k-ensure \
           /etc/depmod.d/imac5k.conf /etc/depmod.d/imac5k-*.conf /etc/sysusers.d/imac5k.conf /etc/tmpfiles.d/imac5k.conf
     rm -rf /usr/local/share/imac5k /usr/local/libexec/imac5k /var/lib/imac5k /var/cache/imac5k
@@ -35,12 +36,13 @@ install -d -m 0755 /usr/local/share/imac5k/stack /etc/kernel/install.d
 install -m 0644 README.md /usr/local/share/imac5k/README.md   # operator manual
 install -m 0755 kernel-install/45-imac5k.install kernel-install/96-imac5k-queue.install -t /etc/kernel/install.d/
 rm -f /etc/kernel/install.d/96-imac5k.install
-install -m 0644 systemd/imac5k-build@.service systemd/imac5k-catchup.service systemd/imac5k-mark-ok.path systemd/imac5k-mark-ok.service -t /etc/systemd/system/
+install -m 0644 systemd/imac5k-build@.service systemd/imac5k-catchup.service systemd/imac5k-mark-ok.path systemd/imac5k-mark-ok.service \
+        systemd/imac5k-confirm.service systemd/imac5k-confirm.timer systemd/imac5k-bootstamp.service -t /etc/systemd/system/
 install -D -m 0644 systemd/user/imac5k-session-check.service /etc/systemd/user/imac5k-session-check.service
 rm -f /etc/depmod.d/imac5k-*.conf
 restorecon -RF /usr/local/sbin /usr/local/share/imac5k /etc/kernel/install.d /etc/systemd/system /etc/systemd/user /etc/depmod.d /etc/sysusers.d /etc/tmpfiles.d /var/lib/imac5k /var/cache/imac5k 2>/dev/null || true
 systemctl daemon-reload
-systemctl enable imac5k-catchup.service imac5k-mark-ok.path
+systemctl enable imac5k-catchup.service imac5k-mark-ok.path imac5k-confirm.timer imac5k-bootstamp.service
 systemctl --global enable imac5k-session-check.service
 systemctl start imac5k-mark-ok.path
 SERIES=${IMAC5K_SERIES:-$(cut -d. -f1-2 <<<"$(uname -r)")}

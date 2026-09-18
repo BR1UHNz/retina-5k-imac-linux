@@ -5,9 +5,11 @@
 #   plugin-remove KVER   kernel-install remove: drop the module directory (state is kept until gc)
 #   queue KVER           start the background build unit for KVER
 #   run KVER             build + install for KVER (run by imac5k-build@KVER.service)
-#   catchup              at boot: account boot attempts, auto-revert, queue missing builds, gc
+#   catchup              at boot: queue missing builds, gc
+#   confirm              late in boot (imac5k-confirm.timer): did the stitched panel come up? account/auto-revert
 #   revert KVER          put KVER back on Fedora's stock amdgpu
 #   mark-ok              record that the running kernel reached a 5K desktop (imac5k-mark-ok.path)
+#   boot-clean           clear this boot's stamp on a clean shutdown (imac5k-bootstamp.service ExecStop)
 #   deploy-stack DIR     install a patch stack directory (series + patches) for one kernel series
 #   status               show every installed kernel and its 5K state
 #   gc                   remove state/cache of kernels that are no longer installed
@@ -49,6 +51,27 @@ stack_id() { cat "$1/STACK_ID"; }
 lock() { exec 9>"$LOCK"; flock 9; }
 trylock() { exec 9>"$LOCK"; flock -w "$1" 9; }
 running_patched() { [[ -e /sys/module/amdgpu/parameters/tiled_stitch ]]; }
+boot_id() { cat /proc/sys/kernel/random/boot_id; }
+
+# Did the patched driver actually bring the stitched panel up? Root-side and session-free: eDP-1 only
+# ever offers the merged 5120x2880 mode when the two tiles are stitched (split mode tops out at
+# 2560x2880 per connector). Deliberately independent of KWin, kscreen and the user session.
+stitch_up() {
+    local c
+    running_patched || return 1
+    for c in /sys/class/drm/card*-eDP-1; do
+        [[ -r $c/modes ]] || continue
+        [[ $(cat "$c/status" 2>/dev/null) == connected ]] || continue
+        [[ $(cat "$c/enabled" 2>/dev/null) == enabled ]] || continue
+        grep -qx '5120x2880' "$c/modes" && return 0
+    done
+    return 1
+}
+
+# This stack already reached a working 5K desktop on this kernel at least once.
+confirmed_stack() {  # KVER SID
+    [[ $(cut -d' ' -f1 "$(kdir "$1")/bootok" 2>/dev/null) == "$2" ]]
+}
 
 # --- notifications: to every graphical session now, else queued for the next login ---
 notify() {  # urgency summary body
@@ -292,19 +315,65 @@ cmd_mark_ok() {
     log "$kver confirmed: 5K desktop reached with stack $sid"
 }
 
-cmd_catchup() {
-    local running kver sd sid newest att
+# One boot of KVER with stack SID never brought the panel up. Two of these in a row put the kernel back
+# on stock amdgpu -- but only while the stack is unproven.
+count_failed_boot() {  # KVER SID
+    local kver=$1 sid=$2 att
+    # A stack that has already brought this panel up on this kernel is known good. Auto-revert exists
+    # to rescue a bad build on its first boots, not to take a working driver away later on.
+    if confirmed_stack "$kver" "$sid"; then
+        log "$kver: stack $sid is already confirmed; keeping the 5K module"
+        return 0
+    fi
+    att=$(( $(cat "$(kdir "$kver")/attempts" 2>/dev/null || echo 0) + 1 ))
+    mkdir -p "$(kdir "$kver")"; printf '%s\n' "$att" > "$(kdir "$kver")/attempts"
+    log "$kver: boot $att with stack $sid did not bring the stitched panel up"
+    if (( att >= REVERT_AFTER_UNCONFIRMED_BOOTS )); then
+        remove_module "$kver"; set_status "$kver" reverted; rm -f "$(kdir "$kver")/attempts"
+        notify critical "Native 5K driver disabled for kernel $kver" \
+            "$att boots in a row never brought the 5K panel up, so this kernel uses the stock driver from its next restart. To try again: sudo imac5k-kmod queue $kver"
+    fi
+}
+
+cmd_boot_clean() {   # clean shutdown: this boot is a deliberate restart, not a hang
+    local kver; kver=$(uname -r)
+    trylock 5 || :
+    rm -f "$(kdir "$kver")/booting"
+}
+
+cmd_confirm() {
+    local kver sd sid att
+    kver=$(uname -r)
     lock
-    running=$(uname -r)
-    # Boot accounting for the running kernel: N consecutive boots with the 5K module loaded but no
-    # confirmed 5K desktop -> that kernel goes back to stock (never the GRUB default, only its module).
-    if [[ -z $R ]] && running_patched && [[ -f $(our_module "$running") ]]; then
-        att=$(( $(cat "$(kdir "$running")/attempts" 2>/dev/null || echo 0) + 1 ))
-        mkdir -p "$(kdir "$running")"; printf '%s\n' "$att" > "$(kdir "$running")/attempts"
-        if (( att >= REVERT_AFTER_UNCONFIRMED_BOOTS )); then
-            remove_module "$running"; set_status "$running" reverted; rm -f "$(kdir "$running")/attempts"
-            notify critical "Native 5K driver disabled for kernel $running" \
-                "$att boots in a row never reached a working 5K desktop, so this kernel uses the stock driver from its next restart. To try again: sudo imac5k-kmod queue $running"
+    running_patched || return 0
+    [[ -f $(our_module "$kver") ]] || return 0
+    sd=$(stack_dir "$kver") || return 0
+    sid=$(stack_id "$sd")
+    rm -f "$(kdir "$kver")/booting"   # judged either way now, so not an unclean boot any more
+    if stitch_up; then
+        mkdir -p "$(kdir "$kver")"
+        printf '%s %s\n' "$sid" "$(date -Is)" > "$(kdir "$kver")/bootok"
+        rm -f "$(kdir "$kver")/attempts"
+        log "$kver confirmed: the stitched panel is up with stack $sid"
+        return 0
+    fi
+    count_failed_boot "$kver" "$sid"
+}
+
+cmd_catchup() {
+    local kver sd sid newest running stamp
+    lock
+    running=$(uname -r); stamp=$(kdir "$running")/booting
+    if [[ -z $R ]]; then
+        # A stamp from a previous boot: that boot loaded the 5K module, never got as far as
+        # imac5k-confirm, and never shut down cleanly -- it hung or was power-cycled. Count it.
+        if [[ -f $stamp && $(cat "$stamp" 2>/dev/null) != "$(boot_id)" ]]; then
+            rm -f "$stamp"
+            log "$running: the previous boot ended without confirming the panel and without a clean shutdown"
+            if sd=$(stack_dir "$running"); then count_failed_boot "$running" "$(stack_id "$sd")"; fi
+        fi
+        if running_patched && [[ -f $(our_module "$running") ]]; then
+            mkdir -p "$(kdir "$running")"; boot_id > "$stamp"
         fi
     fi
     newest=$(newest_kernel)
@@ -403,6 +472,8 @@ case ${1:-} in
     catchup)       cmd_catchup ;;
     revert)        cmd_revert "${2:?KVER}" ;;
     mark-ok)       cmd_mark_ok ;;
+    confirm)       cmd_confirm ;;
+    boot-clean)    cmd_boot_clean ;;
     deploy-stack)  cmd_deploy_stack "${2:?DIR}" ;;
     status)        cmd_status ;;
     gc)            lock; cmd_gc ;;
