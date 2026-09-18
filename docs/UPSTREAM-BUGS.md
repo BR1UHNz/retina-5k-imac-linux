@@ -5,8 +5,11 @@ need Apple hardware to reproduce; they affect any DCE 6/8/10/11.x (and, for the 
 one, DCE 12) board. They are listed here because they were found while making the
 iMac 5K panel work, and because fixes for the first three are in `patches/fixes/`.
 
-None of these have been submitted upstream yet. When they are, this file will
-carry links to the mailing-list threads.
+**Upstream status.** Bugs 1 and 6 are reported together as [drm/amd issue
+#5858](https://gitlab.freedesktop.org/drm/amd/-/issues/5858), open since 2026-09-17.
+The other four have not been reported: 2 and 3 are gated off here rather than repaired,
+4 is worked around instead of fixed, and 5 needs DCE 12 hardware to confirm.
+Signed-off-by patches for 1 and 6 exist and can go to amd-gfx if a maintainer asks.
 
 ---
 
@@ -37,7 +40,7 @@ at its absolute address with the master CRTC index as the value (see
 
 DCE 11.2 uses the same address. An upstream fix needs `0x1924` for DCE 6/8.
 
-Fix: `patches/fixes/13-dce-genlock.patch`.
+Fix: `patches/fixes/13-dce-genlock.patch`. Reported upstream: [drm/amd#5858](https://gitlab.freedesktop.org/drm/amd/-/issues/5858).
 
 ---
 
@@ -121,4 +124,4 @@ Measured on this machine with both tiles lit: memory pinned at 1362 MHz, ~48 W a
 load, 83 C. With the flag derived correctly: memory idles at 143 MHz, ~17 W.
 
 Fix: `patches/fixes/19-dce10-pplib-in-sync.patch`. It is not Apple-specific — it
-restores on DCE 10 what DCE 11+ already do.
+restores on DCE 10 what DCE 11+ already do. Reported upstream: [drm/amd#5858](https://gitlab.freedesktop.org/drm/amd/-/issues/5858).
